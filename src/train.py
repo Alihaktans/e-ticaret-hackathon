@@ -38,7 +38,10 @@ def main():
     feature_cols = [
         'jaccard_sim', 'query_coverage', 'exact_match', 
         'brand_in_query', 'cat_overlap', 'attr_overlap',
-        'query_word_len', 'title_word_len', 'len_diff'
+        'query_word_len', 'title_word_len', 'len_diff',
+        'jaccard_stemmed', 'query_coverage_stemmed',
+        'jaccard_3gram', 'query_coverage_3gram',
+        'jaccard_4gram', 'query_coverage_4gram'
     ]
     
     X = train_df.select(feature_cols).to_numpy()
