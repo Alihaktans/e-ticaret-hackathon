@@ -22,11 +22,19 @@ def clean_text_polars(col_name):
     )
 
 def stem_text_python(text):
-    """Metindeki kelimelerin Türkçe köklerini bulur"""
+    """Metindeki kelimelerin Türkçe köklerini bulur (Tamamen Hata Korumalı)"""
     if not text:
         return ""
     words = text.split()
-    return " ".join(turk_stemmer.stemWords(words))
+    stemmed_words = []
+    for word in words:
+        try:
+            # Kelimeyi köküne indirgemeyi dener
+            stemmed_words.append(turk_stemmer.stemWord(word))
+        except Exception:
+            # Kütüphanenin hata fırlattığı (IndexError, AssertionError vb.) tüm bozuk kelimeleri korur
+            stemmed_words.append(word)
+    return " ".join(stemmed_words)
 
 def get_char_ngrams_python(text, n=3):
     """Metni karakter düzeyinde n-gram'lara böler (Boşlukları kaldırarak)"""
@@ -80,15 +88,15 @@ def build_features_polars(pairs_df, items_df, terms_df, mode="train"):
         (pl.col("intersect_words").list.len() / pl.col("union_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_sim"),
         (pl.col("intersect_words").list.len() / pl.col("q_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage"),
         
-        # 2. Türkçe Kök Düzeyinde Benzerlikler (Yeni)
+        # 2. Türkçe Kök Düzeyinde Benzerlikler
         (pl.col("intersect_stem_words").list.len() / pl.col("union_stem_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_stemmed"),
         (pl.col("intersect_stem_words").list.len() / pl.col("q_stem_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage_stemmed"),
         
-        # 3. Karakter 3-Gram Benzerlikleri (Yeni)
+        # 3. Karakter 3-Gram Benzerlikleri
         (pl.col("intersect_3gram").list.len() / pl.col("union_3gram").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_3gram"),
         (pl.col("intersect_3gram").list.len() / pl.col("q_3gram").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage_3gram"),
         
-        # 4. Karakter 4-Gram Benzerlikleri (Yeni)
+        # 4. Karakter 4-Gram Benzerlikleri
         (pl.col("intersect_4gram").list.len() / pl.col("union_4gram").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_4gram"),
         (pl.col("intersect_4gram").list.len() / pl.col("q_4gram").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage_4gram"),
         
@@ -128,7 +136,7 @@ def main():
     raw_path = os.path.join(project_root, "data", "raw")
     processed_path = os.path.join(project_root, "data", "processed")
     
-    print("=== ADIM 5: GELİŞMİŞ TÜRKÇE NLP ÖZELLİK MÜHENDİSLİĞİ PIPELINE ===\n")
+    print("=== ADIM 5: %100 SAF POLARS GELİŞMİŞ TÜRKÇE NLP PIPELINE ===\n")
     
     print("[1] Katalog verileri yükleniyor ve temizleniyor...")
     items = pl.read_csv(os.path.join(raw_path, "items.csv"))
@@ -145,22 +153,23 @@ def main():
         clean_text_polars("query").alias("clean_query")
     ])
     
-    print("   - Katalog kelime kökleri ve n-gram'lar çıkarılıyor...")
-    # Katalog düzeyinde (bir kez) hızlı python map işlemleri
-    items_pd = items.to_pandas()
-    terms_pd = terms.to_pandas()
+    print("   - Katalog kelime kökleri ve n-gram'lar çıkarılıyor (Saf Polars)...")
     
-    items_pd['stem_title'] = items_pd['clean_title'].apply(stem_text_python)
-    terms_pd['stem_query'] = terms_pd['clean_query'].apply(stem_text_python)
+    # map_elements ile Python kütüphanelerini güvenle çalıştırıyoruz
+    terms = terms.with_columns([
+        pl.col("clean_query").map_elements(stem_text_python, return_dtype=pl.String).alias("stem_query"),
+        pl.col("clean_query").map_elements(lambda x: get_char_ngrams_python(x, 3), return_dtype=pl.List(pl.String)).alias("q_3gram"),
+        pl.col("clean_query").map_elements(lambda x: get_char_ngrams_python(x, 4), return_dtype=pl.List(pl.String)).alias("q_4gram")
+    ])
     
-    items_pd['t_3gram'] = items_pd['clean_title'].apply(lambda x: get_char_ngrams_python(x, 3))
-    terms_pd['q_3gram'] = terms_pd['clean_query'].apply(lambda x: get_char_ngrams_python(x, 3))
+    items = items.with_columns([
+        pl.col("clean_title").map_elements(stem_text_python, return_dtype=pl.String).alias("stem_title"),
+        pl.col("clean_title").map_elements(lambda x: get_char_ngrams_python(x, 3), return_dtype=pl.List(pl.String)).alias("t_3gram"),
+        pl.col("clean_title").map_elements(lambda x: get_char_ngrams_python(x, 4), return_dtype=pl.List(pl.String)).alias("t_4gram")
+    ])
     
-    items_pd['t_4gram'] = items_pd['clean_title'].apply(lambda x: get_char_ngrams_python(x, 4))
-    terms_pd['q_4gram'] = terms_pd['clean_query'].apply(lambda x: get_char_ngrams_python(x, 4))
-    
-    items = pl.from_pandas(items_pd[['item_id', 'clean_title', 'clean_category', 'clean_attributes', 'clean_brand', 'stem_title', 't_3gram', 't_4gram']])
-    terms = pl.from_pandas(terms_pd[['term_id', 'clean_query', 'stem_query', 'q_3gram', 'q_4gram']])
+    items = items.select(['item_id', 'clean_title', 'clean_category', 'clean_attributes', 'clean_brand', 'stem_title', 't_3gram', 't_4gram'])
+    terms = terms.select(['term_id', 'clean_query', 'stem_query', 'q_3gram', 'q_4gram'])
     
     # 2. Train İşleme (Yığınlar Halinde)
     train_pairs_path = os.path.join(processed_path, "train_with_negatives.csv")

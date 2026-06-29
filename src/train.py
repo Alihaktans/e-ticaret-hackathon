@@ -24,7 +24,7 @@ def find_best_threshold(y_true, y_pred_probs):
     return best_threshold, best_f1
 
 def main():
-    print("=== ADIM 6: MODEL EĞİTİMİ VE F1 SKORU OPTİMİZASYONU ===\n")
+    print("=== ADIM 6: GELİŞMİŞ MODEL EĞİTİMİ VE F1 SKORU OPTİMİZASYONU ===\n")
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
@@ -33,8 +33,9 @@ def main():
     # 1. Verilerin Yüklenmesi
     print("[1] Eğitim özellikleri yükleniyor...")
     train_df = pl.read_csv(os.path.join(processed_path, "train_features.csv"))
-    print(f"✔ {len(train_df):,} eğitim satırı yüklendi.")
+    print(f"✔ {len(train_df):,} eğitim satırı başarıyla yüklendi.")
     
+    # Yeni 15 özellikten oluşan gelişmiş listemiz
     feature_cols = [
         'jaccard_sim', 'query_coverage', 'exact_match', 
         'brand_in_query', 'cat_overlap', 'attr_overlap',
@@ -48,12 +49,15 @@ def main():
     y = train_df.select("label").to_numpy().ravel()
     groups = train_df.select("term_id").to_numpy().ravel()
     
+    print(f"   - Kullanılacak gelişmiş özellik sayısı: {len(feature_cols)}")
+    
     # 2. GroupKFold Çapraz Doğrulama
     print("\n[2] 5-Fold GroupKFold Çapraz Doğrulama başlatılıyor (term_id bazlı)...")
     gkf = GroupKFold(n_splits=5)
     
     oof_predictions = np.zeros(len(train_df))
     models = []
+    feature_importances = np.zeros(len(feature_cols))
     
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=groups)):
         print(f"\n--- FOLD {fold + 1} EĞİTİLİYOR ---")
@@ -63,27 +67,31 @@ def main():
         train_dataset = lgb.Dataset(X_train, label=y_train)
         val_dataset = lgb.Dataset(X_val, label=y_val, reference=train_dataset)
         
+        # Gelişmiş, Kaggle seviyesi hiperparametreler
         params = {
             'objective': 'binary',
-            'metric': 'auc', # Olasılık eğitimi için AUC çok kararlıdır
+            'metric': 'auc',
             'boosting_type': 'gbdt',
-            'learning_rate': 0.05,
-            'num_leaves': 31,
-            'max_depth': 6,
-            'feature_fraction': 0.8,
+            'learning_rate': 0.02,       # Daha yavaş ve hassas öğrenme (0.05'ten 0.02'ye düşürüldü)
+            'num_leaves': 63,            # Daha karmaşık ilişkileri yakalamak için (31'den 63'e çıkarıldı)
+            'max_depth': 8,              # Derinlik artırıldı
+            'min_data_in_leaf': 100,     # Aşırı ezberlemeyi (overfitting) engellemek için eklendi
+            'feature_fraction': 0.8,     # Özelliklerin %80'ini rastgele seç
+            'bagging_fraction': 0.8,     # Satırların %80'ini rastgele seç (genelleme yeteneği için)
+            'bagging_freq': 1,
             'verbose': -1,
-            'random_state': 42,
+            'random_state': 42 + fold,   # Çeşitlilik için fold bazlı seed kaydırma
             'n_jobs': -1
         }
         
         model = lgb.train(
             params,
             train_dataset,
-            num_boost_round=1000,
+            num_boost_round=1500,        # Learning rate düştüğü için ağaç sayısını artırdık
             valid_sets=[train_dataset, val_dataset],
             callbacks=[
-                lgb.early_stopping(stopping_rounds=50, verbose=False),
-                lgb.log_evaluation(period=100)
+                lgb.early_stopping(stopping_rounds=100, verbose=False), # Erken durdurma hassasiyetini artırdık
+                lgb.log_evaluation(period=200)
             ]
         )
         
@@ -91,9 +99,10 @@ def main():
         oof_predictions[val_idx] = val_preds
         models.append(model)
         
-        # Olasılık bazlı Fold AUC Skoru (Bilgi amaçlı)
+        # Özellik önem derecelerini biriktiriyoruz (Gain tipinde)
+        feature_importances += model.feature_importance(importance_type='gain') / 5
+        
         fold_auc = roc_auc_score(y_val, val_preds)
-        # 0.5 eşiğindeki varsayılan F1 skoru (Karşılaştırma için)
         fold_f1_default = f1_score(y_val, (val_preds >= 0.5).astype(int))
         print(f"✔ Fold {fold + 1} | ROC-AUC: {fold_auc:.5f} | Varsayılan F1 (0.50): {fold_f1_default:.5f}")
         
@@ -106,20 +115,29 @@ def main():
     print(f"✔ Optimize Edilmiş Yerel F1 Skoru      : {best_f1:.5f}")
     print("==================================================\n")
     
-    # 4. Test Kümesi Üzerinde Tahmin (Inference)
+    # Özellik Önem Derecelerini Yazdırma
+    print("[Özellik Önem Dereceleri (Gain)]")
+    importance_df = pl.DataFrame({
+        "Feature": feature_cols,
+        "Importance": feature_importances
+    }).sort("Importance", descending=True)
+    
+    for row in importance_df.iter_rows():
+        print(f"   - {row[0]:25}: {row[1]:.2f}")
+    print()
+    
+    # 4. Test Tahmini (Inference)
     print("[4] Test kümesi yükleniyor ve tahminler yapılıyor (Inference)...")
     test_df = pl.read_csv(os.path.join(processed_path, "test_features.csv"))
     X_test = test_df.select(feature_cols).to_numpy()
     
-    # Fold modellerinin ortalama olasılık çıktısını alıyoruz
     test_preds_prob = np.zeros(len(test_df))
     for model in models:
         test_preds_prob += model.predict(X_test, num_iteration=model.best_iteration) / len(models)
         
-    # Olasılıkları bulduğumuz en iyi eşik değerine göre 0 veya 1'e dönüştürüyoruz (Hard labeling)
     test_preds_binary = (test_preds_prob >= best_threshold).astype(np.int8)
     
-    # 5. Teslimat (Submission) Dosyasının Hazırlanması
+    # 5. Submission Hazırlanması
     print("\n[5] Submission (teslimat) dosyası hazırlanıyor...")
     submission = test_df.select("id").with_columns(
         pl.Series("prediction", test_preds_binary)
@@ -128,7 +146,7 @@ def main():
     sub_path = os.path.join(processed_path, "submission.csv")
     submission.write_csv(sub_path)
     print(f"✔ Teslimat dosyası başarıyla diske kaydedildi: {sub_path}")
-    print("✔ Model eğitimi ve F1 optimizasyonu tamamlandı!")
+    print("✔ Model eğitimi ve gelişmiş optimizasyonlar başarıyla tamamlandı!")
 
 if __name__ == "__main__":
     main()
