@@ -31,16 +31,20 @@ def main():
     train_df = pl.read_csv(os.path.join(processed_path, "train_features.csv"))
     print(f"✔ {len(train_df):,} eğitim satırı yüklendi.")
     
+    # 14 özellik içeren güncel listemiz (Renk ve materyal eklendi)
     feature_cols = [
         'jaccard_sim', 'query_coverage', 'exact_match', 
         'brand_in_query', 'cat_overlap', 'attr_overlap',
         'query_word_len', 'title_word_len', 'len_diff',
-        'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim'
+        'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim',
+        'color_match', 'material_match'
     ]
     
     X = train_df.select(feature_cols).to_numpy()
     y = train_df.select("label").to_numpy().ravel()
     groups = train_df.select("term_id").to_numpy().ravel()
+    
+    print(f"   - Kullanılacak güncel özellik sayısı: {len(feature_cols)}")
     
     # 2. GroupKFold Çapraz Doğrulama
     print("\n[2] 5-Fold GroupKFold Çapraz Doğrulama başlatılıyor...")
@@ -78,7 +82,6 @@ def main():
         }
         
         try:
-            # Önce GPU parametreleriyle dener
             lgb_model = lgb.train(
                 lgb_params, train_dataset, num_boost_round=2000,
                 valid_sets=[train_dataset, val_dataset],
@@ -86,7 +89,6 @@ def main():
             )
             print("       ✔ LightGBM GPU üzerinde eğitildi.")
         except Exception as e:
-            # GPU hata verirse CPU fallback moduna geçer
             print(f"       ⚠️ Uyarı: LightGBM GPU hatası verdi ({e}). CPU moduna geçiliyor...")
             lgb_params['device'] = 'cpu'
             lgb_model = lgb.train(
@@ -132,10 +134,9 @@ def main():
         fold_auc = roc_auc_score(y_val, fold_blend_preds)
         print(f"       ✔ Fold {fold + 1} Blend ROC-AUC Skoru: {fold_auc:.5f}")
         
-        # Bellek rahatlatma
         gc.collect()
 
-    # 3. Eşik Değeri Optimizasyonu (Blended OOF üzerinden)
+    # 3. Eşik Değeri Optimizasyonu
     print("\n[3] Tüm doğrulama kümesi üzerinde En İyi Eşik Değeri (Threshold) aranıyor...")
     best_threshold, best_f1 = find_best_threshold(y, oof_predictions)
     
@@ -149,7 +150,6 @@ def main():
     test_df = pl.read_csv(os.path.join(processed_path, "test_features.csv"))
     X_test = test_df.select(feature_cols).to_numpy()
     
-    # Tüm modellerin (5 lgb + 5 cb) tahminlerini birleştiriyoruz
     test_preds_prob = np.zeros(len(test_df))
     for lgb_m, cb_m in zip(lgb_models, cb_models):
         lgb_p = lgb_m.predict(X_test, num_iteration=lgb_m.best_iteration)
@@ -167,7 +167,7 @@ def main():
     sub_path = os.path.join(processed_path, "submission.csv")
     submission.write_csv(sub_path)
     print(f"✔ Teslimat dosyası başarıyla diske kaydedildi: {sub_path}")
-    print("✔ GPU-Hızlandırmalı Çift Modelli Ensemble eğitimi başarıyla tamamlandı!")
+    print("✔ Gelişmiş Çift Modelli Ensemble eğitimi yeni özelliklerle tamamlandı!")
 
 if __name__ == "__main__":
     main()

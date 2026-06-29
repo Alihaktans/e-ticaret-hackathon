@@ -8,7 +8,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 # Türkçe kök bulucunun tanımlanması
 turk_stemmer = stemmer('turkish')
 
-# Global TF-IDF değişkeni (Döngü içinde transform etmek için)
 global_vectorizer = None
 
 def clean_text_polars(col_name):
@@ -40,7 +39,7 @@ def stem_text_python(text):
 
 def build_features_polars(pairs_df, items_df, terms_df, mode="train"):
     """
-    TF-IDF ve Kök bulma özelliklerini içeren optimize edilmiş pipeline.
+    Renk ve Materyal eşleşmelerini de içeren gelişmiş pipeline.
     """
     df = pairs_df.join(items_df, on="item_id", how="left")
     df = df.join(terms_df, on="term_id", how="left")
@@ -75,6 +74,21 @@ def build_features_polars(pairs_df, items_df, terms_df, mode="train"):
         (pl.col("intersect_stem_words").list.len() / pl.col("union_stem_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_stemmed"),
         (pl.col("intersect_stem_words").list.len() / pl.col("q_stem_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage_stemmed"),
         
+        # 3. Nokta Atışı Özellik Eşleşmeleri (Yeni Özellikler!)
+        # Sorgu, ürünün attribute renk bilgisini içeriyor mu?
+        pl.when((pl.col("color_attr") != "") & (pl.col("clean_query").str.contains(pl.col("color_attr"), literal=True)))
+        .then(1.0)
+        .otherwise(0.0)
+        .cast(pl.Float32)
+        .alias("color_match"),
+        
+        # Sorgu, ürünün attribute materyal bilgisini içeriyor mu?
+        pl.when((pl.col("material_attr") != "") & (pl.col("clean_query").str.contains(pl.col("material_attr"), literal=True)))
+        .then(1.0)
+        .otherwise(0.0)
+        .cast(pl.Float32)
+        .alias("material_match"),
+        
         # Diğer özellikler
         pl.col("clean_title").str.contains(pl.col("clean_query"), literal=True).cast(pl.Float32).alias("exact_match"),
         pl.when((pl.col("clean_brand") != "") & (pl.col("clean_brand") != "missing_value") & (pl.col("clean_query").str.contains(pl.col("clean_brand"), literal=True))).then(1.0).otherwise(0.0).cast(pl.Float32).alias("brand_in_query"),
@@ -89,16 +103,13 @@ def build_features_polars(pairs_df, items_df, terms_df, mode="train"):
         (pl.col("title_word_len") - pl.col("query_word_len")).cast(pl.Int8).alias("len_diff")
     ])
     
-    # Hızlı TF-IDF Cosine Benzerliği Hesaplama (Yığın düzeyinde)
+    # TF-IDF Cosine Benzerliği
     print("     > TF-IDF Kosinüs Benzerliği hesaplanıyor...")
     queries_clean = df['clean_query'].to_list()
     titles_clean = df['clean_title'].to_list()
     
-    # Seyrek matris dönüşümleri ve hızlı skaler çarpım
     q_tfidf = global_vectorizer.transform(queries_clean)
     t_tfidf = global_vectorizer.transform(titles_clean)
-    
-    # Satır bazlı kosinüs benzerliği
     tfidf_sim = np.array(q_tfidf.multiply(t_tfidf).sum(axis=1)).ravel()
     
     df = df.with_columns([
@@ -110,7 +121,8 @@ def build_features_polars(pairs_df, items_df, terms_df, mode="train"):
         'jaccard_sim', 'query_coverage', 'exact_match', 
         'brand_in_query', 'cat_overlap', 'attr_overlap',
         'query_word_len', 'title_word_len', 'len_diff',
-        'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim'
+        'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim',
+        'color_match', 'material_match' # Yeni sütunlar eklendi
     ]
     if "id" in df.columns:
         cols_to_keep.append("id")
@@ -126,7 +138,7 @@ def main():
     raw_path = os.path.join(project_root, "data", "raw")
     processed_path = os.path.join(project_root, "data", "processed")
     
-    print("=== ADIM 5: GELİŞMİŞ TF-IDF VE KÖK DOĞRULAMALI PIPELINE ===\n")
+    print("=== ADIM 5: GELİŞMİŞ TF-IDF VE ATTRIBUTE EŞLEŞTİRMELİ PIPELINE ===\n")
     
     print("[1] Katalog verileri yükleniyor ve temizleniyor...")
     items = pl.read_csv(os.path.join(raw_path, "items.csv"))
@@ -143,25 +155,27 @@ def main():
         clean_text_polars("query").alias("clean_query")
     ])
     
+    # Rust seviyesinde Regex kullanarak Renk ve Materyal özniteliklerini ayıklama (İnanılmaz hızlı çalışır)
+    print("   - Katalog özniteliklerinden Renk ve Materyal bilgileri ayıklanıyor...")
+    items = items.with_columns([
+        pl.col("clean_attributes").str.extract(r"renk\s*:\s*([^,]+)", 1).fill_null("").str.strip_chars().alias("color_attr"),
+        pl.col("clean_attributes").str.extract(r"materyal\s*:\s*([^,]+)", 1).fill_null("").str.strip_chars().alias("material_attr")
+    ])
+    
     print("   - Katalog kelime kökleri çıkarılıyor (Saf Polars)...")
     terms = terms.with_columns([
         pl.col("clean_query").map_elements(stem_text_python, return_dtype=pl.String).alias("stem_query")
     ])
-    
     items = items.with_columns([
         pl.col("clean_title").map_elements(stem_text_python, return_dtype=pl.String).alias("stem_title")
     ])
     
-    # 2. TF-IDF Vektörleştiricinin Katalog Üzerinde Eğitilmesi
     print("   - TF-IDF Vektörleştirici eğitiliyor (Katalog üzerinden)...")
-    
-    # Tüm katalog başlıklarını hızlıca NumPy üzerinden Python listesine çeviriyoruz (Bellek dostudur)
     all_titles = items.select("clean_title").to_numpy().ravel().tolist()
-    
     global_vectorizer = TfidfVectorizer(max_features=50000, lowercase=False)
     global_vectorizer.fit(all_titles)
     
-    items = items.select(['item_id', 'clean_title', 'clean_category', 'clean_attributes', 'clean_brand', 'stem_title'])
+    items = items.select(['item_id', 'clean_title', 'clean_category', 'clean_attributes', 'clean_brand', 'stem_title', 'color_attr', 'material_attr'])
     terms = terms.select(['term_id', 'clean_query', 'stem_query'])
     
     # 3. Train İşleme
@@ -186,7 +200,7 @@ def main():
     del test_pairs
     gc.collect()
     
-    print("=== TÜM GELİŞMİŞ ÖZELLİKLER BAŞARIYLA OLUŞTURULDU VE KAYDEDİLDİ ===")
+    print("=== TÜM ÖZELLİKLER BAŞARIYLA OLUŞTURULDU VE KAYDEDİLDİ ===")
 
 def process_in_batches(pairs_df, items_df, terms_df, out_path, mode="train", chunk_size=500_000):
     total_rows = len(pairs_df)
