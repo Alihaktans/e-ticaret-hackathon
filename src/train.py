@@ -1,139 +1,160 @@
 import os
+import gc
 import polars as pl
 import numpy as np
 import lightgbm as lgb
+import catboost as cb
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import f1_score, roc_auc_score
 
 def find_best_threshold(y_true, y_pred_probs):
-    """
-    OOF olasılık tahminleri üzerinde tarama yaparak 
-    en yüksek F1 skorunu veren en iyi eşik değerini (threshold) bulur.
-    """
+    """OOF tahminleri üzerinde tarama yaparak en iyi F1 eşik değerini bulur"""
     best_threshold = 0.5
     best_f1 = 0.0
-    
-    # 0.01 ile 0.99 arasındaki tüm eşik değerlerini deniyoruz
     for threshold in np.arange(0.01, 1.0, 0.01):
         preds = (y_pred_probs >= threshold).astype(int)
         score = f1_score(y_true, preds)
         if score > best_f1:
             best_f1 = score
             best_threshold = threshold
-            
     return best_threshold, best_f1
 
 def main():
-    print("=== ADIM 6: GELİŞMİŞ MODEL EĞİTİMİ VE F1 SKORU OPTİMİZASYONU ===\n")
+    print("=== ADIM 6: GELİŞMİŞ GPU-DESTEKLİ ÇİFT MODELLİ ENSEMBLE EĞİTİMİ ===\n")
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
     processed_path = os.path.join(project_root, "data", "processed")
     
     # 1. Verilerin Yüklenmesi
-    print("[1] Eğitim özellikleri yükleniyor...")
+    print("[1] Özellik matrisleri yükleniyor...")
     train_df = pl.read_csv(os.path.join(processed_path, "train_features.csv"))
-    print(f"✔ {len(train_df):,} eğitim satırı başarıyla yüklendi.")
+    print(f"✔ {len(train_df):,} eğitim satırı yüklendi.")
     
-    # Yeni 15 özellikten oluşan gelişmiş listemiz
     feature_cols = [
         'jaccard_sim', 'query_coverage', 'exact_match', 
         'brand_in_query', 'cat_overlap', 'attr_overlap',
         'query_word_len', 'title_word_len', 'len_diff',
-        'jaccard_stemmed', 'query_coverage_stemmed',
-        'jaccard_3gram', 'query_coverage_3gram',
-        'jaccard_4gram', 'query_coverage_4gram'
+        'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim'
     ]
     
     X = train_df.select(feature_cols).to_numpy()
     y = train_df.select("label").to_numpy().ravel()
     groups = train_df.select("term_id").to_numpy().ravel()
     
-    print(f"   - Kullanılacak gelişmiş özellik sayısı: {len(feature_cols)}")
-    
     # 2. GroupKFold Çapraz Doğrulama
-    print("\n[2] 5-Fold GroupKFold Çapraz Doğrulama başlatılıyor (term_id bazlı)...")
+    print("\n[2] 5-Fold GroupKFold Çapraz Doğrulama başlatılıyor...")
     gkf = GroupKFold(n_splits=5)
     
     oof_predictions = np.zeros(len(train_df))
-    models = []
-    feature_importances = np.zeros(len(feature_cols))
+    lgb_models = []
+    cb_models = []
     
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=groups)):
         print(f"\n--- FOLD {fold + 1} EĞİTİLİYOR ---")
         X_train, y_train = X[train_idx], y[train_idx]
         X_val, y_val = X[val_idx], y[val_idx]
         
+        # --- A. LIGHTGBM EĞİTİMİ (GPU / CUDA) ---
+        print("     > LightGBM (GPU) eğitiliyor...")
         train_dataset = lgb.Dataset(X_train, label=y_train)
         val_dataset = lgb.Dataset(X_val, label=y_val, reference=train_dataset)
         
-        # Gelişmiş, Kaggle seviyesi hiperparametreler
-        params = {
+        lgb_params = {
             'objective': 'binary',
             'metric': 'auc',
             'boosting_type': 'gbdt',
-            'learning_rate': 0.02,       # Daha yavaş ve hassas öğrenme (0.05'ten 0.02'ye düşürüldü)
-            'num_leaves': 63,            # Daha karmaşık ilişkileri yakalamak için (31'den 63'e çıkarıldı)
-            'max_depth': 8,              # Derinlik artırıldı
-            'min_data_in_leaf': 100,     # Aşırı ezberlemeyi (overfitting) engellemek için eklendi
-            'feature_fraction': 0.8,     # Özelliklerin %80'ini rastgele seç
-            'bagging_fraction': 0.8,     # Satırların %80'ini rastgele seç (genelleme yeteneği için)
+            'learning_rate': 0.015,       # Hassas ve derin öğrenme hızı
+            'num_leaves': 63,
+            'max_depth': 8,
+            'min_data_in_leaf': 100,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
             'bagging_freq': 1,
+            'device': 'cuda',            # GPU (CUDA) AKTİF
             'verbose': -1,
-            'random_state': 42 + fold,   # Çeşitlilik için fold bazlı seed kaydırma
+            'random_state': 42 + fold,
             'n_jobs': -1
         }
         
-        model = lgb.train(
-            params,
-            train_dataset,
-            num_boost_round=1500,        # Learning rate düştüğü için ağaç sayısını artırdık
-            valid_sets=[train_dataset, val_dataset],
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=100, verbose=False), # Erken durdurma hassasiyetini artırdık
-                lgb.log_evaluation(period=200)
-            ]
+        try:
+            # Önce GPU parametreleriyle dener
+            lgb_model = lgb.train(
+                lgb_params, train_dataset, num_boost_round=2000,
+                valid_sets=[train_dataset, val_dataset],
+                callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)]
+            )
+            print("       ✔ LightGBM GPU üzerinde eğitildi.")
+        except Exception as e:
+            # GPU hata verirse CPU fallback moduna geçer
+            print(f"       ⚠️ Uyarı: LightGBM GPU hatası verdi ({e}). CPU moduna geçiliyor...")
+            lgb_params['device'] = 'cpu'
+            lgb_model = lgb.train(
+                lgb_params, train_dataset, num_boost_round=2000,
+                valid_sets=[train_dataset, val_dataset],
+                callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)]
+            )
+            print("       ✔ LightGBM CPU üzerinde eğitildi.")
+            
+        lgb_preds = lgb_model.predict(X_val, num_iteration=lgb_model.best_iteration)
+        lgb_models.append(lgb_model)
+        
+        # --- B. CATBOOST EĞİTİMİ (GPU) ---
+        print("     > CatBoost (GPU) eğitiliyor...")
+        cb_model = cb.CatBoostClassifier(
+            iterations=2000,
+            learning_rate=0.015,         # Hassas ve derin öğrenme hızı
+            depth=6,
+            loss_function='Logloss',
+            eval_metric='AUC',
+            task_type='GPU',            # GPU AKTİF
+            random_seed=42 + fold,
+            early_stopping_rounds=100,
+            verbose=0
         )
         
-        val_preds = model.predict(X_val, num_iteration=model.best_iteration)
-        oof_predictions[val_idx] = val_preds
-        models.append(model)
+        try:
+            cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), use_best_model=True)
+            print("       ✔ CatBoost GPU üzerinde eğitildi.")
+        except Exception as e:
+            print(f"       ⚠️ Uyarı: CatBoost GPU hatası verdi ({e}). CPU moduna geçiliyor...")
+            cb_model.set_params(task_type='CPU', thread_count=-1)
+            cb_model.fit(X_train, y_train, eval_set=(X_val, y_val), use_best_model=True)
+            print("       ✔ CatBoost CPU üzerinde eğitildi.")
+            
+        cb_preds = cb_model.predict_proba(X_val)[:, 1]
+        cb_models.append(cb_model)
         
-        # Özellik önem derecelerini biriktiriyoruz (Gain tipinde)
-        feature_importances += model.feature_importance(importance_type='gain') / 5
+        # --- C. HİBRİT TAHMİN BİRLEŞTİRME (LGBM %50 + CatBoost %50) ---
+        fold_blend_preds = (lgb_preds * 0.5) + (cb_preds * 0.5)
+        oof_predictions[val_idx] = fold_blend_preds
         
-        fold_auc = roc_auc_score(y_val, val_preds)
-        fold_f1_default = f1_score(y_val, (val_preds >= 0.5).astype(int))
-        print(f"✔ Fold {fold + 1} | ROC-AUC: {fold_auc:.5f} | Varsayılan F1 (0.50): {fold_f1_default:.5f}")
+        fold_auc = roc_auc_score(y_val, fold_blend_preds)
+        print(f"       ✔ Fold {fold + 1} Blend ROC-AUC Skoru: {fold_auc:.5f}")
         
-    # 3. Eşik Değeri Optimizasyonu
+        # Bellek rahatlatma
+        gc.collect()
+
+    # 3. Eşik Değeri Optimizasyonu (Blended OOF üzerinden)
     print("\n[3] Tüm doğrulama kümesi üzerinde En İyi Eşik Değeri (Threshold) aranıyor...")
     best_threshold, best_f1 = find_best_threshold(y, oof_predictions)
     
     print("\n==================================================")
     print(f"✔ En İyi Eşik Değeri (Best Threshold) : {best_threshold:.2f}")
-    print(f"✔ Optimize Edilmiş Yerel F1 Skoru      : {best_f1:.5f}")
+    print(f"✔ Optimize Edilmiş Hibrit F1 Skoru     : {best_f1:.5f}")
     print("==================================================\n")
     
-    # Özellik Önem Derecelerini Yazdırma
-    print("[Özellik Önem Dereceleri (Gain)]")
-    importance_df = pl.DataFrame({
-        "Feature": feature_cols,
-        "Importance": feature_importances
-    }).sort("Importance", descending=True)
-    
-    for row in importance_df.iter_rows():
-        print(f"   - {row[0]:25}: {row[1]:.2f}")
-    print()
-    
-    # 4. Test Tahmini (Inference)
+    # 4. Test Kümesi Üzerinde Tahmin (Inference - Ensemble)
     print("[4] Test kümesi yükleniyor ve tahminler yapılıyor (Inference)...")
     test_df = pl.read_csv(os.path.join(processed_path, "test_features.csv"))
     X_test = test_df.select(feature_cols).to_numpy()
     
+    # Tüm modellerin (5 lgb + 5 cb) tahminlerini birleştiriyoruz
     test_preds_prob = np.zeros(len(test_df))
-    for model in models:
-        test_preds_prob += model.predict(X_test, num_iteration=model.best_iteration) / len(models)
+    for lgb_m, cb_m in zip(lgb_models, cb_models):
+        lgb_p = lgb_m.predict(X_test, num_iteration=lgb_m.best_iteration)
+        cb_p = cb_m.predict_proba(X_test)[:, 1]
+        test_preds_prob += ((lgb_p * 0.5) + (cb_p * 0.5)) / len(lgb_models)
         
     test_preds_binary = (test_preds_prob >= best_threshold).astype(np.int8)
     
@@ -146,7 +167,7 @@ def main():
     sub_path = os.path.join(processed_path, "submission.csv")
     submission.write_csv(sub_path)
     print(f"✔ Teslimat dosyası başarıyla diske kaydedildi: {sub_path}")
-    print("✔ Model eğitimi ve gelişmiş optimizasyonlar başarıyla tamamlandı!")
+    print("✔ GPU-Hızlandırmalı Çift Modelli Ensemble eğitimi başarıyla tamamlandı!")
 
 if __name__ == "__main__":
     main()

@@ -3,9 +3,13 @@ import gc
 import polars as pl
 import numpy as np
 from snowballstemmer import stemmer
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 # Türkçe kök bulucunun tanımlanması
 turk_stemmer = stemmer('turkish')
+
+# Global TF-IDF değişkeni (Döngü içinde transform etmek için)
+global_vectorizer = None
 
 def clean_text_polars(col_name):
     """Polars Expressions kullanarak Rust seviyesinde çok hızlı metin temizleme"""
@@ -29,76 +33,47 @@ def stem_text_python(text):
     stemmed_words = []
     for word in words:
         try:
-            # Kelimeyi köküne indirgemeyi dener
             stemmed_words.append(turk_stemmer.stemWord(word))
         except Exception:
-            # Kütüphanenin hata fırlattığı (IndexError, AssertionError vb.) tüm bozuk kelimeleri korur
             stemmed_words.append(word)
     return " ".join(stemmed_words)
 
-def get_char_ngrams_python(text, n=3):
-    """Metni karakter düzeyinde n-gram'lara böler (Boşlukları kaldırarak)"""
-    text_clean = str(text).replace(" ", "")
-    if not text_clean:
-        return []
-    if len(text_clean) < n:
-        return [text_clean]
-    return [text_clean[i:i+n] for i in range(len(text_clean) - n + 1)]
-
 def build_features_polars(pairs_df, items_df, terms_df, mode="train"):
     """
-    Kök bulma ve karakter n-gram özelliklerini içeren gelişmiş pipeline.
+    TF-IDF ve Kök bulma özelliklerini içeren optimize edilmiş pipeline.
     """
-    # Birleştirme (Join)
     df = pairs_df.join(items_df, on="item_id", how="left")
     df = df.join(terms_df, on="term_id", how="left")
     
-    # Kelime listelerine bölme (Orijinal ve Kök halleri için)
+    # Kelime listelerine bölme
     df = df.with_columns([
         pl.col("clean_query").str.split(" ").alias("q_words"),
         pl.col("clean_title").str.split(" ").alias("t_words"),
         pl.col("clean_category").str.split(" ").alias("cat_words"),
         pl.col("clean_attributes").str.split(" ").alias("attr_words"),
         
-        # Kök kelimelerin listeye bölünmesi
         pl.col("stem_query").str.split(" ").alias("q_stem_words"),
         pl.col("stem_title").str.split(" ").alias("t_stem_words")
     ])
     
-    # Küme kesişimleri (Orijinal metinler için)
+    # Küme kesişimleri
     df = df.with_columns([
         pl.col("q_words").list.set_intersection("t_words").alias("intersect_words"),
         pl.col("q_words").list.set_union("t_words").alias("union_words"),
         
-        # Kök metinler için kesişimler
         pl.col("q_stem_words").list.set_intersection("t_stem_words").alias("intersect_stem_words"),
-        pl.col("q_stem_words").list.set_union("t_stem_words").alias("union_stem_words"),
-        
-        # Karakter N-Gram kesişimleri
-        pl.col("q_3gram").list.set_intersection("t_3gram").alias("intersect_3gram"),
-        pl.col("q_3gram").list.set_union("t_3gram").alias("union_3gram"),
-        
-        pl.col("q_4gram").list.set_intersection("t_4gram").alias("intersect_4gram"),
-        pl.col("q_4gram").list.set_union("t_4gram").alias("union_4gram")
+        pl.col("q_stem_words").list.set_union("t_stem_words").alias("union_stem_words")
     ])
     
-    # Metriklerin hesaplanması
+    # Benzerliklerin hesaplanması
     df = df.with_columns([
-        # 1. Kelime Düzeyinde Benzerlikler (Orijinal)
+        # 1. Kelime Düzeyinde Benzerlikler
         (pl.col("intersect_words").list.len() / pl.col("union_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_sim"),
         (pl.col("intersect_words").list.len() / pl.col("q_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage"),
         
         # 2. Türkçe Kök Düzeyinde Benzerlikler
         (pl.col("intersect_stem_words").list.len() / pl.col("union_stem_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_stemmed"),
         (pl.col("intersect_stem_words").list.len() / pl.col("q_stem_words").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage_stemmed"),
-        
-        # 3. Karakter 3-Gram Benzerlikleri
-        (pl.col("intersect_3gram").list.len() / pl.col("union_3gram").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_3gram"),
-        (pl.col("intersect_3gram").list.len() / pl.col("q_3gram").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage_3gram"),
-        
-        # 4. Karakter 4-Gram Benzerlikleri
-        (pl.col("intersect_4gram").list.len() / pl.col("union_4gram").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("jaccard_4gram"),
-        (pl.col("intersect_4gram").list.len() / pl.col("q_4gram").list.len()).fill_nan(0.0).fill_null(0.0).cast(pl.Float32).alias("query_coverage_4gram"),
         
         # Diğer özellikler
         pl.col("clean_title").str.contains(pl.col("clean_query"), literal=True).cast(pl.Float32).alias("exact_match"),
@@ -114,14 +89,28 @@ def build_features_polars(pairs_df, items_df, terms_df, mode="train"):
         (pl.col("title_word_len") - pl.col("query_word_len")).cast(pl.Int8).alias("len_diff")
     ])
     
+    # Hızlı TF-IDF Cosine Benzerliği Hesaplama (Yığın düzeyinde)
+    print("     > TF-IDF Kosinüs Benzerliği hesaplanıyor...")
+    queries_clean = df['clean_query'].to_list()
+    titles_clean = df['clean_title'].to_list()
+    
+    # Seyrek matris dönüşümleri ve hızlı skaler çarpım
+    q_tfidf = global_vectorizer.transform(queries_clean)
+    t_tfidf = global_vectorizer.transform(titles_clean)
+    
+    # Satır bazlı kosinüs benzerliği
+    tfidf_sim = np.array(q_tfidf.multiply(t_tfidf).sum(axis=1)).ravel()
+    
+    df = df.with_columns([
+        pl.Series("tfidf_sim", tfidf_sim).cast(pl.Float32)
+    ])
+    
     cols_to_keep = [
         'term_id', 'item_id', 
         'jaccard_sim', 'query_coverage', 'exact_match', 
         'brand_in_query', 'cat_overlap', 'attr_overlap',
         'query_word_len', 'title_word_len', 'len_diff',
-        'jaccard_stemmed', 'query_coverage_stemmed',
-        'jaccard_3gram', 'query_coverage_3gram',
-        'jaccard_4gram', 'query_coverage_4gram'
+        'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim'
     ]
     if "id" in df.columns:
         cols_to_keep.append("id")
@@ -131,12 +120,13 @@ def build_features_polars(pairs_df, items_df, terms_df, mode="train"):
     return df.select(cols_to_keep)
 
 def main():
+    global global_vectorizer
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
     raw_path = os.path.join(project_root, "data", "raw")
     processed_path = os.path.join(project_root, "data", "processed")
     
-    print("=== ADIM 5: %100 SAF POLARS GELİŞMİŞ TÜRKÇE NLP PIPELINE ===\n")
+    print("=== ADIM 5: GELİŞMİŞ TF-IDF VE KÖK DOĞRULAMALI PIPELINE ===\n")
     
     print("[1] Katalog verileri yükleniyor ve temizleniyor...")
     items = pl.read_csv(os.path.join(raw_path, "items.csv"))
@@ -153,25 +143,28 @@ def main():
         clean_text_polars("query").alias("clean_query")
     ])
     
-    print("   - Katalog kelime kökleri ve n-gram'lar çıkarılıyor (Saf Polars)...")
-    
-    # map_elements ile Python kütüphanelerini güvenle çalıştırıyoruz
+    print("   - Katalog kelime kökleri çıkarılıyor (Saf Polars)...")
     terms = terms.with_columns([
-        pl.col("clean_query").map_elements(stem_text_python, return_dtype=pl.String).alias("stem_query"),
-        pl.col("clean_query").map_elements(lambda x: get_char_ngrams_python(x, 3), return_dtype=pl.List(pl.String)).alias("q_3gram"),
-        pl.col("clean_query").map_elements(lambda x: get_char_ngrams_python(x, 4), return_dtype=pl.List(pl.String)).alias("q_4gram")
+        pl.col("clean_query").map_elements(stem_text_python, return_dtype=pl.String).alias("stem_query")
     ])
     
     items = items.with_columns([
-        pl.col("clean_title").map_elements(stem_text_python, return_dtype=pl.String).alias("stem_title"),
-        pl.col("clean_title").map_elements(lambda x: get_char_ngrams_python(x, 3), return_dtype=pl.List(pl.String)).alias("t_3gram"),
-        pl.col("clean_title").map_elements(lambda x: get_char_ngrams_python(x, 4), return_dtype=pl.List(pl.String)).alias("t_4gram")
+        pl.col("clean_title").map_elements(stem_text_python, return_dtype=pl.String).alias("stem_title")
     ])
     
-    items = items.select(['item_id', 'clean_title', 'clean_category', 'clean_attributes', 'clean_brand', 'stem_title', 't_3gram', 't_4gram'])
-    terms = terms.select(['term_id', 'clean_query', 'stem_query', 'q_3gram', 'q_4gram'])
+    # 2. TF-IDF Vektörleştiricinin Katalog Üzerinde Eğitilmesi
+    print("   - TF-IDF Vektörleştirici eğitiliyor (Katalog üzerinden)...")
     
-    # 2. Train İşleme (Yığınlar Halinde)
+    # Tüm katalog başlıklarını hızlıca NumPy üzerinden Python listesine çeviriyoruz (Bellek dostudur)
+    all_titles = items.select("clean_title").to_numpy().ravel().tolist()
+    
+    global_vectorizer = TfidfVectorizer(max_features=50000, lowercase=False)
+    global_vectorizer.fit(all_titles)
+    
+    items = items.select(['item_id', 'clean_title', 'clean_category', 'clean_attributes', 'clean_brand', 'stem_title'])
+    terms = terms.select(['term_id', 'clean_query', 'stem_query'])
+    
+    # 3. Train İşleme
     train_pairs_path = os.path.join(processed_path, "train_with_negatives.csv")
     print(f"\n[2] Eğitim kümesi yükleniyor: {train_pairs_path}")
     train_pairs = pl.read_csv(train_pairs_path)
@@ -182,7 +175,7 @@ def main():
     del train_pairs
     gc.collect()
     
-    # 3. Test İşleme (Yığınlar Halinde)
+    # 4. Test İşleme
     test_pairs_path = os.path.join(raw_path, "submission_pairs.csv")
     print(f"[3] Test (submission) kümesi yükleniyor: {test_pairs_path}")
     test_pairs = pl.read_csv(test_pairs_path)
