@@ -1,0 +1,12 @@
+﻿pandas
+polars
+pyarrow
+numpy
+scikit-learn
+rapidfuzz
+tqdm
+matplotlib
+jupyter
+ipykernel
+scipy
+joblib
