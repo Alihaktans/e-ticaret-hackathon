@@ -15,5 +15,7 @@ dependencies = [
     "scikit-learn>=1.7.2",
     "sentence-transformers>=5.6.0",
     "snowballstemmer>=3.1.1",
+    "torch>=2.12.1",
     "tqdm>=4.68.3",
+    "transformers>=5.12.1",
 ]

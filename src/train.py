@@ -37,7 +37,7 @@ def main():
         'brand_in_query', 'cat_overlap', 'attr_overlap',
         'query_word_len', 'title_word_len', 'len_diff',
         'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim',
-        'color_match', 'material_match'
+        'color_match', 'material_match', 'bert_sim'
     ]
     
     X = train_df.select(feature_cols).to_numpy()
