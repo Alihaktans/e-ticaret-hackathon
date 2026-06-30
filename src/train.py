@@ -20,7 +20,7 @@ def find_best_threshold(y_true, y_pred_probs):
     return best_threshold, best_f1
 
 def main():
-    print("=== ADIM 6: GELİŞMİŞ GPU-DESTEKLİ ÇİFT MODELLİ ENSEMBLE EĞİTİMİ ===\n")
+    print("=== ADIM 6: HİBRİT GPU-DESTEKLİ TOPLULUK (ENSEMBLE) EĞİTİMİ ===\n")
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
@@ -31,13 +31,16 @@ def main():
     train_df = pl.read_csv(os.path.join(processed_path, "train_features.csv"))
     print(f"✔ {len(train_df):,} eğitim satırı yüklendi.")
     
-    # 14 özellik içeren güncel listemiz (Renk ve materyal eklendi)
+    # 21 Özellikten Oluşan Şampiyon Kadro
     feature_cols = [
         'jaccard_sim', 'query_coverage', 'exact_match', 
         'brand_in_query', 'cat_overlap', 'attr_overlap',
         'query_word_len', 'title_word_len', 'len_diff',
         'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim',
-        'color_match', 'material_match', 'bert_sim'
+        'color_match', 'material_match',
+        'bert_sim_title', 'bert_sim_category', 'bert_sim_attributes', # Çoklu anlamsal benzerlikler
+        'jaccard_3gram', 'query_coverage_3gram',
+        'jaccard_4gram', 'query_coverage_4gram' # Morfolojik n-gram'lar
     ]
     
     X = train_df.select(feature_cols).to_numpy()
@@ -59,8 +62,8 @@ def main():
         X_train, y_train = X[train_idx], y[train_idx]
         X_val, y_val = X[val_idx], y[val_idx]
         
-        # --- A. LIGHTGBM EĞİTİMİ (GPU / CUDA) ---
-        print("     > LightGBM (GPU) eğitiliyor...")
+        # --- A. LIGHTGBM EĞİTİMİ (CPU Fallback) ---
+        print("     > LightGBM (CPU) eğitiliyor...")
         train_dataset = lgb.Dataset(X_train, label=y_train)
         val_dataset = lgb.Dataset(X_val, label=y_val, reference=train_dataset)
         
@@ -68,35 +71,25 @@ def main():
             'objective': 'binary',
             'metric': 'auc',
             'boosting_type': 'gbdt',
-            'learning_rate': 0.015,       # Hassas ve derin öğrenme hızı
+            'learning_rate': 0.015,
             'num_leaves': 63,
             'max_depth': 8,
             'min_data_in_leaf': 100,
             'feature_fraction': 0.8,
             'bagging_fraction': 0.8,
             'bagging_freq': 1,
-            'device': 'cuda',            # GPU (CUDA) AKTİF
+            'device': 'cpu', # OpenCL kilitlenmesini engellemek için CPU garantili
             'verbose': -1,
             'random_state': 42 + fold,
             'n_jobs': -1
         }
         
-        try:
-            lgb_model = lgb.train(
-                lgb_params, train_dataset, num_boost_round=2000,
-                valid_sets=[train_dataset, val_dataset],
-                callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)]
-            )
-            print("       ✔ LightGBM GPU üzerinde eğitildi.")
-        except Exception as e:
-            print(f"       ⚠️ Uyarı: LightGBM GPU hatası verdi ({e}). CPU moduna geçiliyor...")
-            lgb_params['device'] = 'cpu'
-            lgb_model = lgb.train(
-                lgb_params, train_dataset, num_boost_round=2000,
-                valid_sets=[train_dataset, val_dataset],
-                callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)]
-            )
-            print("       ✔ LightGBM CPU üzerinde eğitildi.")
+        lgb_model = lgb.train(
+            lgb_params, train_dataset, num_boost_round=2000,
+            valid_sets=[train_dataset, val_dataset],
+            callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)]
+        )
+        print("       ✔ LightGBM başarıyla eğitildi.")
             
         lgb_preds = lgb_model.predict(X_val, num_iteration=lgb_model.best_iteration)
         lgb_models.append(lgb_model)
@@ -105,11 +98,11 @@ def main():
         print("     > CatBoost (GPU) eğitiliyor...")
         cb_model = cb.CatBoostClassifier(
             iterations=2000,
-            learning_rate=0.015,         # Hassas ve derin öğrenme hızı
+            learning_rate=0.015,
             depth=6,
             loss_function='Logloss',
             eval_metric='AUC',
-            task_type='GPU',            # GPU AKTİF
+            task_type='GPU',            # GPU (CUDA) AKTİF
             random_seed=42 + fold,
             early_stopping_rounds=100,
             verbose=0
@@ -127,8 +120,9 @@ def main():
         cb_preds = cb_model.predict_proba(X_val)[:, 1]
         cb_models.append(cb_model)
         
-        # --- C. HİBRİT TAHMİN BİRLEŞTİRME (LGBM %50 + CatBoost %50) ---
-        fold_blend_preds = (lgb_preds * 0.5) + (cb_preds * 0.5)
+        # --- C. HİBRİT TAHMİN BİRLEŞTİRME (LGBM %30 + CatBoost %70) ---
+        # Tabular veri setlerinde CatBoost'un kararlılığına %70 ağırlık veriyoruz
+        fold_blend_preds = (lgb_preds * 0.3) + (cb_preds * 0.7)
         oof_predictions[val_idx] = fold_blend_preds
         
         fold_auc = roc_auc_score(y_val, fold_blend_preds)
@@ -154,9 +148,11 @@ def main():
     for lgb_m, cb_m in zip(lgb_models, cb_models):
         lgb_p = lgb_m.predict(X_test, num_iteration=lgb_m.best_iteration)
         cb_p = cb_m.predict_proba(X_test)[:, 1]
-        test_preds_prob += ((lgb_p * 0.5) + (cb_p * 0.5)) / len(lgb_models)
+        # Kararlı olması için %70 Catboost, %30 LightGBM birleşimi kullanıyoruz
+        test_preds_prob += ((lgb_p * 0.3) + (cb_p * 0.7)) / len(lgb_models)
         
-    test_preds_binary = (test_preds_prob >= best_threshold).astype(np.int8)
+    # Sınıf dengesizliği ve yanlış pozitifleri (False Positives) temizlemek için 0.55 güvenli eşiğiyle kesiyoruz
+    test_preds_binary = (test_preds_prob >= 0.55).astype(np.int8)
     
     # 5. Submission Hazırlanması
     print("\n[5] Submission (teslimat) dosyası hazırlanıyor...")
@@ -167,7 +163,7 @@ def main():
     sub_path = os.path.join(processed_path, "submission.csv")
     submission.write_csv(sub_path)
     print(f"✔ Teslimat dosyası başarıyla diske kaydedildi: {sub_path}")
-    print("✔ Gelişmiş Çift Modelli Ensemble eğitimi yeni özelliklerle tamamlandı!")
+    print("✔ Gelişmiş Hibrit Eğitim tamamlandı!")
 
 if __name__ == "__main__":
     main()
