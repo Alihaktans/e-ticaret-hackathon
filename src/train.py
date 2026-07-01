@@ -151,8 +151,9 @@ def main():
         # Kararlı olması için %70 Catboost, %30 LightGBM birleşimi kullanıyoruz
         test_preds_prob += ((lgb_p * 0.3) + (cb_p * 0.7)) / len(lgb_models)
         
-    # Sınıf dengesizliği ve yanlış pozitifleri (False Positives) temizlemek için 0.55 güvenli eşiğiyle kesiyoruz
-    test_preds_binary = (test_preds_prob >= 0.55).astype(np.int8)
+    
+    # Modelin kendi bulduğu en iyi eşik değerini (best_threshold = 0.45) kullanıyoruz
+    test_preds_binary = (test_preds_prob >= best_threshold).astype(np.int8) 
     
     # 5. Submission Hazırlanması
     print("\n[5] Submission (teslimat) dosyası hazırlanıyor...")
