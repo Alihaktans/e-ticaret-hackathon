@@ -7,12 +7,11 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from tqdm import tqdm
 
-# CUDA (GPU) Kontrolü
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Kullanılacak Cihaz: {device.upper()}")
 
 class CrossEncoderInferenceDataset(Dataset):
-    """Test verilerini BERT'e beslemek üzere hazırlayan PyTorch Dataset yapısı"""
+    """Test/Train çiftlerini BERT için hazırlayan Dataset yapısı"""
     def __init__(self, queries, titles, tokenizer, max_len=96):
         self.queries = queries
         self.titles = titles
@@ -34,8 +33,56 @@ class CrossEncoderInferenceDataset(Dataset):
         )
         return {key: val.squeeze(0) for key, val in encoding.items()}
 
+def predict_and_save(pairs_df, items, terms, model, tokenizer, out_npy_path):
+    """Belirli bir çift veri kümesi için BERT Cross-Encoder tahmin olasılıklarını üretip kaydeder."""
+    # Metinlerle birleştirme (Join)
+    df = pairs_df.join(items, on="item_id", how="left")
+    df = df.join(terms, on="term_id", how="left")
+    
+    df = df.with_columns([
+        pl.col("query").fill_null(""),
+        pl.col("title").fill_null("")
+    ])
+    
+    queries = df["query"].to_list()
+    titles = df["title"].to_list()
+    
+    del df
+    gc.collect()
+    
+    # DataLoader kurulumu (batch_size=512 ile RTX 4070 için optimize edilmiştir)
+    dataset = CrossEncoderInferenceDataset(queries, titles, tokenizer)
+    loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=4, pin_memory=True)
+    
+    probs_list = []
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Tahmin Ediliyor"):
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+            token_type_ids = batch['token_type_ids'].to(device, non_blocking=True)
+            
+            with torch.amp.autocast('cuda'):
+                outputs = model(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask, 
+                    token_type_ids=token_type_ids
+                )
+            
+            logits = outputs.logits
+            # Binary sınıflandırmada 1 (Alakalı) sınıfına ait olasılık değerini alıyoruz
+            probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy().astype(np.float16)
+            probs_list.extend(probs)
+            
+    # NumPy binary olarak kaydet
+    np.save(out_npy_path, np.array(probs_list, dtype=np.float16))
+    print(f"    ✔ Tahminler diske başarıyla kaydedildi: {out_npy_path}\n")
+    
+    del queries, titles, probs_list
+    gc.collect()
+
 def main():
-    print("=== ADIM 8: TÜRKÇE BERT CROSS-ENCODER TEST TAHMİNİ (INFERENCE) ===\n")
+    print("=== ADIM 3: SIZINTISIZ BERT CROSS-ENCODER TAHMİNLERİ (INFERENCE) ===\n")
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
@@ -48,89 +95,47 @@ def main():
         print(f"❌ Hata: Eğitilmiş model bulunamadı: {model_path}")
         return
         
-    # 1. Model ve Tokenizer Yükleme
+    # Model ve Tokenizer Yükleme
     print("[1] Eğitilmiş Türkçe BERT modeli diske yükleniyor...")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=2)
     model = model.to(device)
-    model.eval() # Modeli değerlendirme moduna alıyoruz (dropout vb. kapanır)
+    model.eval()
     print("    ✔ Model GPU belleğine alındı.")
     
-    # 2. Test Verilerinin Yüklenmesi ve Hazırlanması
-    print("\n[2] Test verileri Polars ile yükleniyor...")
-    test_pairs = pl.read_csv(os.path.join(raw_path, "submission_pairs.csv"))
+    # Katalog verileri yükleme
+    print("\n[2] Katalog verileri yükleniyor...")
     items = pl.read_csv(os.path.join(raw_path, "items.csv")).select(["item_id", "title"])
     terms = pl.read_csv(os.path.join(raw_path, "terms.csv")).select(["term_id", "query"])
     
-    # Test çiftlerini metinlerle birleştiriyoruz
-    test_df = test_pairs.join(items, on="item_id", how="left")
-    test_df = test_df.join(terms, on="term_id", how="left")
-    
-    test_df = test_df.with_columns([
-        pl.col("query").fill_null(""),
-        pl.col("title").fill_null("")
-    ])
-    
-    test_ids = test_df["id"].to_list()
-    queries = test_df["query"].to_list()
-    titles = test_df["title"].to_list()
-    
-    # Belleği rahatlatmak için dataframe'leri siliyoruz
-    del test_pairs, items, terms, test_df
+    # A. Eğitim Kümesi İçin Tahmin Üretme (1.58M satır)
+    train_pairs_path = os.path.join(processed_path, "train_pairs_split.csv")
+    print(f"\n[3] Sızıntısız Eğitim kümesi işleniyor: {train_pairs_path}")
+    train_pairs = pl.read_csv(train_pairs_path)
+    train_out_npy = os.path.join(processed_path, "train_bert_cross_sim.npy")
+    predict_and_save(train_pairs, items, terms, model, tokenizer, train_out_npy)
+    del train_pairs
     gc.collect()
     
-    # 3. Dataset ve DataLoader Tanımlaması
-    print("\n[3] PyTorch DataLoader hazırlanıyor (RTX 4070 için optimize edildi)...")
-    inference_dataset = CrossEncoderInferenceDataset(queries, titles, tokenizer)
+    # B. Doğrulama Kümesi İçin Tahmin Üretme (168K satır)
+    val_pairs_path = os.path.join(processed_path, "val_pairs_split.csv")
+    print(f"[4] Sızıntısız Doğrulama kümesi işleniyor: {val_pairs_path}")
+    val_pairs = pl.read_csv(val_pairs_path)
+    val_out_npy = os.path.join(processed_path, "val_bert_cross_sim.npy")
+    predict_and_save(val_pairs, items, terms, model, tokenizer, val_out_npy)
+    del val_pairs
+    gc.collect()
     
-    # batch_size=512 ve num_workers=4 ile veri akışını son derece hızlandırıyoruz
-    inference_loader = DataLoader(
-        inference_dataset, 
-        batch_size=512, 
-        shuffle=False, 
-        num_workers=4, 
-        pin_memory=True
-    )
+    # C. Test Kümesi İçin Tahmin Üretme (3.36M satır)
+    test_pairs_path = os.path.join(raw_path, "submission_pairs.csv")
+    print(f"[5] Test (submission) kümesi işleniyor: {test_pairs_path}")
+    test_pairs = pl.read_csv(test_pairs_path)
+    test_out_npy = os.path.join(processed_path, "test_bert_cross_sim.npy")
+    predict_and_save(test_pairs, items, terms, model, tokenizer, test_out_npy)
+    del test_pairs
+    gc.collect()
     
-    # 4. GPU-Hızlandırmalı Tahmin Döngüsü
-    print(f"\n[4] 3,359,679 satır için tahminler üretiliyor...")
-    print("    - FP16 (Yarı hassasiyet) aktif edilerek işlem hızı maksimuma çıkarıldı.")
-    print("    - Tahmin süresi: ~25 - 35 dakika.\n")
-    
-    predictions = []
-    
-    # Gradyan hesaplamalarını kapatarak bellekten ve işlemden devasa tasarruf sağlıyoruz
-    with torch.no_grad():
-        for batch in tqdm(inference_loader, desc="Tahmin Ediliyor"):
-            # Verileri GPU'ya taşıyoruz
-            input_ids = batch['input_ids'].to(device, non_blocking=True)
-            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
-            token_type_ids = batch['token_type_ids'].to(device, non_blocking=True)
-            
-            # Autocast ile FP16 yarı hassasiyette hızlı forward pass yapıyoruz
-            with torch.amp.autocast('cuda'):
-                outputs = model(
-                    input_ids=input_ids, 
-                    attention_mask=attention_mask, 
-                    token_type_ids=token_type_ids
-                )
-            
-            # Logit değerlerini olasılığa dönüştürme ve argmax ile doğrudan 0 veya 1 etiketini alma
-            logits = outputs.logits
-            batch_predictions = torch.argmax(logits, dim=-1).cpu().numpy().astype(np.int8)
-            predictions.extend(batch_predictions)
-            
-    # 5. Teslimat (Submission) Dosyasının Kaydedilmesi
-    print("\n[5] Submission (teslimat) dosyası hazırlanıyor...")
-    submission = pl.DataFrame({
-        "id": test_ids,
-        "prediction": predictions
-    })
-    
-    sub_path = os.path.join(processed_path, "submission.csv")
-    submission.write_csv(sub_path)
-    print(f"✔ Teslimat dosyası başarıyla kaydedildi: {sub_path}")
-    print("=== TAHMİN SÜRECİ TAMAMLANDI ===")
+    print("=== TÜM TAHMİNLER BAŞARIYLA TAMAMLANDI VE KAYDEDİLDİ ===")
 
 if __name__ == "__main__":
     main()

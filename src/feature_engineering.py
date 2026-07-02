@@ -6,6 +6,9 @@ import numpy as np
 from snowballstemmer import stemmer
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+# Çekirdek sayısını sınırlayarak laptopunuzun ısınmasını kesin olarak önlüyoruz
+os.environ["POLARS_MAX_THREADS"] = "4"
+
 # Türkçe kök bulucunun tanımlanması
 turk_stemmer = stemmer('turkish')
 global_vectorizer = None
@@ -46,14 +49,14 @@ def get_char_ngrams_python(text, n=3):
         return [text_clean]
     return [text_clean[i:i+n] for i in range(len(text_clean) - n + 1)]
 
-def build_features_polars(pairs_df, items_df, terms_df, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, mode="train"):
+def build_features_polars(pairs_df, items_df, terms_df, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, chunk_cross_sim, mode="train"):
     """
-    On-the-fly n-gram hesaplaması içeren bellek dostu pipeline.
+    Tüm anlamsal, istatistiksel ve morfolojik özellikleri içeren sızıntısız pipeline.
     """
     df = pairs_df.join(items_df, on="item_id", how="left")
     df = df.join(terms_df, on="term_id", how="left")
     
-    # 1. Bellek Tasarrufu İçin N-Gram'ları Sadece Bu Aktif Parça (500k) İçin Üretiyoruz
+    # Bellek tasarrufu için N-Gram'ları sadece bu aktif 500k'lık parça için üretiyoruz
     df = df.with_columns([
         pl.col("clean_query").map_elements(lambda x: get_char_ngrams_python(x, 3), return_dtype=pl.List(pl.String)).alias("q_3gram"),
         pl.col("clean_title").map_elements(lambda x: get_char_ngrams_python(x, 3), return_dtype=pl.List(pl.String)).alias("t_3gram"),
@@ -61,12 +64,13 @@ def build_features_polars(pairs_df, items_df, terms_df, term_map, item_map, term
         pl.col("clean_title").map_elements(lambda x: get_char_ngrams_python(x, 4), return_dtype=pl.List(pl.String)).alias("t_4gram")
     ])
     
-    # Kelime listelerine bölme
+    # Kelime listelerine bölme (Orijinal ve Kök halleri için)
     df = df.with_columns([
         pl.col("clean_query").str.split(" ").alias("q_words"),
         pl.col("clean_title").str.split(" ").alias("t_words"),
         pl.col("clean_category").str.split(" ").alias("cat_words"),
         pl.col("clean_attributes").str.split(" ").alias("attr_words"),
+        
         pl.col("stem_query").str.split(" ").alias("q_stem_words"),
         pl.col("stem_title").str.split(" ").alias("t_stem_words")
     ])
@@ -116,22 +120,21 @@ def build_features_polars(pairs_df, items_df, terms_df, term_map, item_map, term
         (pl.col("title_word_len") - pl.col("query_word_len")).cast(pl.Int8).alias("len_diff")
     ])
     
-    # TF-IDF Cosine Benzerliği
-    print("     > TF-IDF Kosinüs Benzerliği hesaplanıyor...")
+    # Okapi BM25'i Taklit Eden (Sublinear TF) Benzerlik
+    print("     > BM25 Kelimesel Benzerlik hesaplanıyor...")
     queries_clean = df['clean_query'].to_list()
     titles_clean = df['clean_title'].to_list()
     q_tfidf = global_vectorizer.transform(queries_clean)
     t_tfidf = global_vectorizer.transform(titles_clean)
-    tfidf_sim = np.array(q_tfidf.multiply(t_tfidf).sum(axis=1)).ravel()
+    bm25_sim = np.array(q_tfidf.multiply(t_tfidf).sum(axis=1)).ravel()
     
-    # Çoklu BERT (E5-Large) Semantik Benzerlikleri
+    # Çoklu E5-Large Semantik Benzerlikleri
     term_ids = df['term_id'].to_list()
     item_ids = df['item_id'].to_list()
     
     q_indices = [term_map.get(tid, 0) for tid in term_ids]
     t_indices = [item_map.get(iid, 0) for iid in item_ids]
     
-    # SSD'den sadece gerekli satırlar anlık olarak okunur (Hafıza dostudur)
     q_vecs = term_emb[q_indices]
     
     bert_sim_title = np.sum(q_vecs * title_emb[t_indices], axis=1)
@@ -139,10 +142,11 @@ def build_features_polars(pairs_df, items_df, terms_df, term_map, item_map, term
     bert_sim_attributes = np.sum(q_vecs * attr_emb[t_indices], axis=1)
     
     df = df.with_columns([
-        pl.Series("tfidf_sim", tfidf_sim).cast(pl.Float32),
+        pl.Series("bm25_sim", bm25_sim).cast(pl.Float32),
         pl.Series("bert_sim_title", bert_sim_title).cast(pl.Float32),
         pl.Series("bert_sim_category", bert_sim_category).cast(pl.Float32),
-        pl.Series("bert_sim_attributes", bert_sim_attributes).cast(pl.Float32)
+        pl.Series("bert_sim_attributes", bert_sim_attributes).cast(pl.Float32),
+        pl.Series("bert_cross_sim", chunk_cross_sim).cast(pl.Float32) # İnce ayarlı Cross-Encoder olasılığı!
     ])
     
     cols_to_keep = [
@@ -150,9 +154,10 @@ def build_features_polars(pairs_df, items_df, terms_df, term_map, item_map, term
         'jaccard_sim', 'query_coverage', 'exact_match', 
         'brand_in_query', 'cat_overlap', 'attr_overlap',
         'query_word_len', 'title_word_len', 'len_diff',
-        'jaccard_stemmed', 'query_coverage_stemmed', 'tfidf_sim',
+        'jaccard_stemmed', 'query_coverage_stemmed', 'bm25_sim',
         'color_match', 'material_match',
         'bert_sim_title', 'bert_sim_category', 'bert_sim_attributes',
+        'bert_cross_sim', # Cross-Encoder Skoru
         'jaccard_3gram', 'query_coverage_3gram',
         'jaccard_4gram', 'query_coverage_4gram'
     ]
@@ -170,21 +175,19 @@ def main():
     raw_path = os.path.join(project_root, "data", "raw")
     processed_path = os.path.join(project_root, "data", "processed")
     
-    print("=== ADIM 5: ŞAMPİYON ÇOKLU ALAN SEMANTİK PIPELINE ===\n")
+    print("=== ADIM 5: SIZINTISIZ ÇOKLU ALAN SEMANTİK PIPELINE ===\n")
     
-    # Vektörleri ve haritaları belleğe alıyoruz (Bellek Haritalamalı mmap_mode='r')
-    print("[1] BERT (E5-Large) Çoklu Alan matrisleri diskten haritalanıyor (mmap)...")
+    print("[1] BERT (E5-Large) Çoklu Alan matrisleri haritalanıyor (mmap)...")
     with open(os.path.join(processed_path, "term_mapping.json"), "r") as f:
         term_map = json.load(f)
     with open(os.path.join(processed_path, "item_mapping.json"), "r") as f:
         item_map = json.load(f)
         
-    # mmap_mode='r' sayesinde bu dosyalar RAM'e yüklenmez, doğrudan diskten (SSD) on-the-fly okunur.
     term_emb = np.load(os.path.join(processed_path, "term_embeddings.npy"), mmap_mode='r')
     title_emb = np.load(os.path.join(processed_path, "item_title_embeddings.npy"), mmap_mode='r')
     cat_emb = np.load(os.path.join(processed_path, "item_category_embeddings.npy"), mmap_mode='r')
     attr_emb = np.load(os.path.join(processed_path, "item_attributes_embeddings.npy"), mmap_mode='r')
-    print("    ✔ 4 ayrı BERT matrisi diske başarıyla haritalandı (Bellek kullanımı: ~0 MB).")
+    print("    ✔ 4 ayrı BERT matrisi başarıyla diske haritalandı (Bellek kullanımı: ~0 MB).")
     
     print("\n[2] Katalog verileri Polars ile yükleniyor...")
     items = pl.read_csv(os.path.join(raw_path, "items.csv"))
@@ -215,36 +218,56 @@ def main():
     items = items.select(['item_id', 'clean_title', 'clean_category', 'clean_attributes', 'clean_brand', 'stem_title', 'color_attr', 'material_attr'])
     terms = terms.select(['term_id', 'clean_query', 'stem_query'])
     
-    print("   - TF-IDF Vektörleştirici eğitiliyor (Katalog üzerinden)...")
+    print("   - BM25 taklit edici TF-IDF Vektörleştirici eğitiliyor...")
     all_titles = items.select("clean_title").to_numpy().ravel().tolist()
-    global_vectorizer = TfidfVectorizer(max_features=50000, lowercase=False)
+    global_vectorizer = TfidfVectorizer(max_features=50000, sublinear_tf=True, lowercase=False)
     global_vectorizer.fit(all_titles)
     
-    # 3. Train İşleme
-    train_pairs_path = os.path.join(processed_path, "train_with_negatives.csv")
-    print(f"\n[3] Eğitim kümesi yükleniyor: {train_pairs_path}")
+    # 3. SIZINTISIZ EĞİTİM KÜMESİ İŞLEME (Cross-Encoder Tahminleriyle)
+    train_pairs_path = os.path.join(processed_path, "train_pairs_split.csv")
+    print(f"\n[3] Sızıntısız Eğitim kümesi yükleniyor: {train_pairs_path}")
     train_pairs = pl.read_csv(train_pairs_path)
     
-    train_out_path = os.path.join(processed_path, "train_features.csv")
-    process_in_batches(train_pairs, items, terms, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, out_path=train_out_path, mode="train", chunk_size=500_000)
+    print("   - İnce ayarlı Türkçe BERT Cross-Encoder eğitim tahminleri yükleniyor...")
+    train_cross_sim = np.load(os.path.join(processed_path, "train_bert_cross_sim.npy")).astype(np.float32)
     
-    del train_pairs
+    train_out_path = os.path.join(processed_path, "train_features.csv")
+    process_in_batches(train_pairs, items, terms, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, train_cross_sim, out_path=train_out_path, mode="train", chunk_size=500_000)
+    
+    del train_pairs, train_cross_sim
     gc.collect()
     
-    # 4. Test İşleme
+    # 4. SIZINTISIZ DOĞRULAMA KÜMESİ İŞLEME (Cross-Encoder Tahminleriyle)
+    val_pairs_path = os.path.join(processed_path, "val_pairs_split.csv")
+    print(f"\n[4] Sızıntısız Doğrulama kümesi yükleniyor: {val_pairs_path}")
+    val_pairs = pl.read_csv(val_pairs_path)
+    
+    print("   - İnce ayarlı Türkçe BERT Cross-Encoder doğrulama tahminleri yükleniyor...")
+    val_cross_sim = np.load(os.path.join(processed_path, "val_bert_cross_sim.npy")).astype(np.float32)
+    
+    val_out_path = os.path.join(processed_path, "val_features.csv")
+    process_in_batches(val_pairs, items, terms, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, val_cross_sim, out_path=val_out_path, mode="val", chunk_size=500_000)
+    
+    del val_pairs, val_cross_sim
+    gc.collect()
+    
+    # 5. TEST (SUBMISSION) KÜMESİ İŞLEME (Cross-Encoder Tahminleriyle)
     test_pairs_path = os.path.join(raw_path, "submission_pairs.csv")
-    print(f"[4] Test (submission) kümesi yükleniyor: {test_pairs_path}")
+    print(f"\n[5] Test (submission) kümesi yükleniyor: {test_pairs_path}")
     test_pairs = pl.read_csv(test_pairs_path)
     
-    test_out_path = os.path.join(processed_path, "test_features.csv")
-    process_in_batches(test_pairs, items, terms, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, out_path=test_out_path, mode="test", chunk_size=500_000)
+    print("   - İnce ayarlı Türkçe BERT Cross-Encoder test tahminleri yükleniyor...")
+    test_cross_sim = np.load(os.path.join(processed_path, "test_bert_cross_sim.npy")).astype(np.float32)
     
-    del test_pairs
+    test_out_path = os.path.join(processed_path, "test_features.csv")
+    process_in_batches(test_pairs, items, terms, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, test_cross_sim, out_path=test_out_path, mode="test", chunk_size=500_000)
+    
+    del test_pairs, test_cross_sim
     gc.collect()
     
     print("=== TÜM GELİŞMİŞ ÖZELLİKLER BAŞARIYLA OLUŞTURULDU VE KAYDEDİLDİ ===")
 
-def process_in_batches(pairs_df, items_df, terms_df, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, out_path, mode="train", chunk_size=500_000):
+def process_in_batches(pairs_df, items_df, terms_df, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, cross_sim_arr, out_path, mode="train", chunk_size=500_000):
     total_rows = len(pairs_df)
     num_chunks = int(np.ceil(total_rows / chunk_size))
     print(f"    - Toplam {total_rows:,} satır, {num_chunks} parça halinde işlenecek.")
@@ -257,12 +280,14 @@ def process_in_batches(pairs_df, items_df, terms_df, term_map, item_map, term_em
         print(f"      > Parça {chunk_num}/{num_chunks} hesaplanıyor...")
         
         chunk = pairs_df[i : i + chunk_size]
-        chunk_features = build_features_polars(chunk, items_df, terms_df, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, mode=mode)
+        chunk_cross_sim = cross_sim_arr[i : i + chunk_size]
+        
+        chunk_features = build_features_polars(chunk, items_df, terms_df, term_map, item_map, term_emb, title_emb, cat_emb, attr_emb, chunk_cross_sim, mode=mode)
         
         with open(out_path, "ab") as f:
             chunk_features.write_csv(f, include_header=(i == 0))
             
-        del chunk, chunk_features
+        del chunk, chunk_features, chunk_cross_sim
         gc.collect()
         
     print(f"    ✔ {mode.upper()} kümesi diske kaydedildi: {out_path}\n")
