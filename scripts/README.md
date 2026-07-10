@@ -19,6 +19,7 @@ gelmez. Dosyalar geriye dönük karşılaştırmalar için korunur.
 | `218` | önceki artefaktlara bağlı OOF meta-ensemble deneyi |
 | `219+` | ham veriden tekrar üretilebilir PU ve içerik tabanlı modeller |
 | `221` | V104 anchor üzerinde embedding destekli, prior-korumalı disagreement patch |
+| `222` | swap bütçeleri için kör, katmanlı insan audit seti ve yerel değerlendirme |
 
 ## Çalıştırma kuralları
 
