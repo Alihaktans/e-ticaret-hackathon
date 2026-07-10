@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from catboost import CatBoostClassifier
+from catboost import CatBoostClassifier, Pool
 from scipy.optimize import nnls
 from sklearn.feature_extraction.text import HashingVectorizer
 
@@ -455,13 +455,15 @@ def fit_model(
     iterations: int,
     valid_x: pd.DataFrame | None = None,
     valid_y: np.ndarray | None = None,
+    valid_weights: np.ndarray | None = None,
 ) -> CatBoostClassifier:
     params = catboost_params(iterations)
     model = CatBoostClassifier(**params)
     fit_kwargs = {}
     if valid_x is not None and valid_y is not None:
+        valid_pool = Pool(valid_x, label=valid_y, weight=valid_weights)
         fit_kwargs = {
-            "eval_set": (valid_x, valid_y),
+            "eval_set": valid_pool,
             "use_best_model": True,
             "early_stopping_rounds": 100,
         }
@@ -537,7 +539,7 @@ def estimate_threshold(oof: pd.DataFrame, test_score: np.ndarray) -> dict:
 def train_and_submit() -> None:
     train = pd.read_parquet(TRAIN_FEATURES)
     train[FEATURES] = train[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
-    y = train["label"].astype(np.int8).to_numpy()
+    y = train["label"].astype(np.int8).to_numpy(copy=True)
     # Arrow-backed parquet columns may expose a read-only NumPy view. We mutate
     # weights for the binary partial-relevance policy, so require an owned array.
     weights = train["sample_weight"].astype(np.float32).to_numpy(copy=True)
@@ -552,15 +554,23 @@ def train_and_submit() -> None:
         + 0.15 * train["word_title"].to_numpy(dtype=np.float32)
     )
     same_root_cutoff = float(np.quantile(lexical_proxy[same_root_mask], 0.35))
+    same_root_positive_cutoff = float(np.quantile(lexical_proxy[same_root_mask], 0.75))
     weak_same_root = same_root_mask & (lexical_proxy <= same_root_cutoff)
+    partial_positive = same_root_mask & (lexical_proxy >= same_root_positive_cutoff)
     weights[same_root_mask] = np.float32(0.0)
     weights[weak_same_root] = np.float32(0.25)
+    # The highest-similarity same-root tail is a conservative proxy for the
+    # partially relevant class, which is positive in the current binary stage.
+    y[partial_positive] = np.int8(1)
+    weights[partial_positive] = np.float32(0.35)
     print(
         {
             "binary_target": "relevant_or_partially_relevant_vs_irrelevant",
             "same_root_unlabeled_zero_weight": int((same_root_mask & ~weak_same_root).sum()),
             "same_root_weak_negative": int(weak_same_root.sum()),
+            "same_root_partial_positive": int(partial_positive.sum()),
             "same_root_proxy_cutoff": same_root_cutoff,
+            "same_root_partial_positive_cutoff": same_root_positive_cutoff,
         },
         flush=True,
     )
@@ -581,6 +591,7 @@ def train_and_submit() -> None:
             ITERATIONS,
             valid_x=train.loc[va, FEATURES],
             valid_y=y[va],
+            valid_weights=weights[va],
         )
         oof_score[va] = model.predict_proba(train.loc[va, FEATURES])[:, 1].astype(np.float32)
         fold_test_scores.append(predict_chunks(model, test))
@@ -591,6 +602,10 @@ def train_and_submit() -> None:
         gc.collect()
 
     oof = train[["id", "term_id", "item_id", "label", "fold", "negative_type"]].copy()
+    oof = oof.rename(columns={"label": "raw_label"})
+    oof["label"] = y
+    oof["training_weight"] = weights
+    oof["partial_positive"] = partial_positive.astype(np.int8)
     oof["score"] = oof_score
     OOF_SCORES.parent.mkdir(parents=True, exist_ok=True)
     oof.to_parquet(OOF_SCORES, index=False, compression="zstd")
@@ -654,9 +669,13 @@ def train_and_submit() -> None:
             "interpretation": "unlabeled because partially relevant is positive in this stage",
             "weak_negative_quantile": 0.35,
             "weak_negative_weight": 0.25,
+            "partial_positive_quantile": 0.75,
+            "partial_positive_weight": 0.35,
             "lexical_proxy_cutoff": same_root_cutoff,
-            "zero_weight_rows": int((same_root_mask & ~weak_same_root).sum()),
+            "partial_positive_lexical_cutoff": same_root_positive_cutoff,
+            "zero_weight_rows": int((same_root_mask & ~weak_same_root & ~partial_positive).sum()),
             "weak_negative_rows": int(weak_same_root.sum()),
+            "partial_positive_rows": int(partial_positive.sum()),
         },
         "warning": (
             "Raw labels are positive-only. Negative labels are synthetic; estimated Macro-F1 and prior "
