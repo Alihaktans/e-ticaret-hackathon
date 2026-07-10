@@ -28,3 +28,15 @@ EXPECTED_COLUMNS = {
     "submission_pairs": ["id", "term_id", "item_id"],
     "sample_submission": ["id", "prediction"],
 }
+
+
+def ensure_output_dirs() -> None:
+    """Create local output directories without touching raw input data."""
+    for path in (
+        PROCESSED_DIR,
+        EDA_REPORTS_DIR,
+        EXPERIMENT_REPORTS_DIR,
+        MODELS_DIR,
+        SUBMISSIONS_DIR,
+    ):
+        path.mkdir(parents=True, exist_ok=True)

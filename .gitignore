@@ -1,25 +1,33 @@
-﻿.venv/
-.venv-1/
+# Python
+.venv/
+.venv-*/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
 
+# Local data and experiment outputs
 data/
 models/
 submissions/
 logs/
 reports/
+_archive/
 
+# Generated artifacts
 *.npy
+*.npz
 *.parquet
 *.csv
+*.pkl
 *.cbm
 *.joblib
 *.log
 
+# Secrets and local editor state
 .env
 .env.*
 secrets.*
-
-_archive/
-
-_archive/
+.idea/
+.vscode/

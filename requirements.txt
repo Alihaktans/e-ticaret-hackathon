@@ -1,12 +1,18 @@
-﻿pandas
-polars
-pyarrow
-numpy
-scikit-learn
-rapidfuzz
-tqdm
-matplotlib
-jupyter
-ipykernel
-scipy
-joblib
+# Core dependencies. For editable development use: pip install -e ".[ml,dev]"
+joblib>=1.3
+numpy>=1.24
+pandas>=2.0
+polars>=0.20
+pyarrow>=14
+rapidfuzz>=3.6
+scikit-learn>=1.3
+scipy>=1.10
+tqdm>=4.66
+
+# Common experiment dependencies
+catboost>=1.2
+matplotlib>=3.8
+sentence-transformers>=2.6
+torch>=2.1
+transformers>=4.39
+datasets>=2.18
