@@ -16,7 +16,8 @@ gelmez. Dosyalar geriye dönük karşılaştırmalar için korunur.
 | `122–164` | gelişmiş lexical/semantic guard ve pairwise modeller |
 | `165–193` | Qwen denetimleri, Trendyol embedding ve contrastive eğitim |
 | `194–217` | bağımsız sınıflandırıcılar, rulepack ve final audit çalışmaları |
-| `218+` | OOF tabanlı meta-ensemble ve kalibrasyon deneyleri |
+| `218` | önceki artefaktlara bağlı OOF meta-ensemble deneyi |
+| `219+` | ham veriden tekrar üretilebilir PU ve içerik tabanlı modeller |
 
 ## Çalıştırma kuralları
 
