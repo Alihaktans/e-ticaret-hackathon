@@ -434,6 +434,8 @@ def train_and_submit() -> None:
         best_iteration = model.get_best_iteration()
         best_iterations.append(ITERATIONS if best_iteration is None or best_iteration <= 0 else best_iteration)
         print({"fold": fold, "train": int(tr.sum()), "valid": int(va.sum())}, flush=True)
+        del model
+        gc.collect()
 
     oof = train[["id", "term_id", "item_id", "label", "fold", "negative_type"]].copy()
     oof["score"] = oof_score
