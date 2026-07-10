@@ -18,6 +18,7 @@ gelmez. Dosyalar geriye dönük karşılaştırmalar için korunur.
 | `194–217` | bağımsız sınıflandırıcılar, rulepack ve final audit çalışmaları |
 | `218` | önceki artefaktlara bağlı OOF meta-ensemble deneyi |
 | `219+` | ham veriden tekrar üretilebilir PU ve içerik tabanlı modeller |
+| `221` | V104 anchor üzerinde embedding destekli, prior-korumalı disagreement patch |
 
 ## Çalıştırma kuralları
 
