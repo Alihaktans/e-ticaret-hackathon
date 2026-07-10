@@ -299,6 +299,9 @@ def write_feature_cache(
         print("using cached", destination, flush=True)
         return
 
+    temporary = destination.with_suffix(".tmp.parquet")
+    if temporary.exists():
+        temporary.unlink()
     word, char = vectorizers()
     writer: pq.ParquetWriter | None = None
     row_count = 0
@@ -314,7 +317,7 @@ def write_feature_cache(
                 table = pa.Table.from_pandas(features, preserve_index=False)
                 if writer is None:
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    writer = pq.ParquetWriter(destination, table.schema, compression="zstd")
+                    writer = pq.ParquetWriter(temporary, table.schema, compression="zstd")
                 writer.write_table(table)
                 row_count += len(features)
                 print(destination.name, row_count, flush=True)
@@ -323,6 +326,9 @@ def write_feature_cache(
     finally:
         if writer is not None:
             writer.close()
+    if writer is None:
+        raise RuntimeError(f"No feature rows were written for {source}")
+    temporary.replace(destination)
     print("saved", destination, row_count, flush=True)
 
 
