@@ -57,6 +57,16 @@ TR_MAP = str.maketrans(
     "cgiosuaiuCGIOSUAIU",
 )
 
+UNITS = {"gb", "tb", "mb", "mah", "w", "wh", "hz", "inch", "inc", "cm", "mm", "ml", "lt", "kg", "gr"}
+ACCESSORY_TOKENS = {
+    "kilif", "case", "kapak", "koruyucu", "kablo", "adapter", "adaptoru",
+    "askisi", "stand", "tutucu", "filtre", "firca", "yedek", "kartus", "toner", "uc",
+}
+MAIN_DEVICE_TOKENS = {
+    "telefon", "iphone", "tablet", "ipad", "laptop", "notebook", "bilgisayar", "monitor",
+    "televizyon", "tv", "yazici", "printer", "supurge", "saat", "watch", "kulaklik",
+}
+
 FEATURES = [
     "word_title",
     "char_title",
@@ -73,8 +83,15 @@ FEATURES = [
     "query_in_title",
     "title_in_query",
     "brand_in_query",
+    "query_has_specs",
     "all_query_digits_in_item",
     "digit_conflict",
+    "spec_overlap_ratio",
+    "spec_conflict",
+    "unit_overlap_ratio",
+    "unit_conflict",
+    "query_main_item_accessory",
+    "query_accessory_item_main",
 ]
 
 
@@ -82,13 +99,39 @@ def norm(value: object) -> str:
     if value is None or pd.isna(value):
         return ""
     text = str(value).lower().translate(TR_MAP)
+    # Preserve decimal/model boundaries before punctuation cleanup: 12.5 -> 12p5.
+    text = re.sub(r"(?<=\d)[.,](?=\d)", "p", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
 def root_category(value: object) -> str:
-    text = norm(value)
-    return text.split(" ", 1)[0] if text else "unknown"
+    if value is None or pd.isna(value):
+        return "unknown"
+    # Category hierarchy separators must be handled before text normalization.
+    first = re.split(r"[/|>]", str(value), maxsplit=1)[0]
+    return norm(first) or "unknown"
+
+
+def token_set(text: str) -> set[str]:
+    return set(text.split()) if text else set()
+
+
+def phrase_in_text(phrase: str, text: str) -> int:
+    if not phrase or not text:
+        return 0
+    return int(f" {phrase} " in f" {text} ")
+
+
+def spec_set(text: str) -> set[str]:
+    # Product/model tokens: 128, 12p5, a55, s24, 205/55 fragments after normalization.
+    return {token for token in text.split() if any(char.isdigit() for char in token)}
+
+
+def overlap_ratio(left: set[str], right: set[str]) -> float:
+    if not left:
+        return 0.0
+    return float(len(left & right) / len(left))
 
 
 def stable_fold(term_id: object) -> int:
@@ -104,7 +147,8 @@ def require_raw() -> None:
 
 
 def prepare_items() -> pd.DataFrame:
-    if ITEM_CACHE.exists():
+    force = os.environ.get("V219_FORCE_PREPARE", "0") == "1"
+    if ITEM_CACHE.exists() and not force:
         print("loading", ITEM_CACHE, flush=True)
         return pd.read_parquet(ITEM_CACHE)
 
@@ -144,18 +188,21 @@ def sample_valid(
     term_id: str,
     positive_set: set[tuple[str, str]],
     positive_item: str,
+    used_negatives: set[tuple[str, str]],
 ) -> str | None:
     if len(candidates) == 0:
         return None
     for _ in range(50):
         item_id = str(candidates[int(rng.integers(0, len(candidates)))])
-        if item_id != positive_item and (term_id, item_id) not in positive_set:
+        key = (term_id, item_id)
+        if item_id != positive_item and key not in positive_set and key not in used_negatives:
             return item_id
     return None
 
 
 def prepare_pairs(items: pd.DataFrame) -> pd.DataFrame:
-    if TRAIN_PAIR_CACHE.exists():
+    force = os.environ.get("V219_FORCE_PREPARE", "0") == "1"
+    if TRAIN_PAIR_CACHE.exists() and not force:
         print("loading", TRAIN_PAIR_CACHE, flush=True)
         return pd.read_parquet(TRAIN_PAIR_CACHE)
 
@@ -172,6 +219,7 @@ def prepare_pairs(items: pd.DataFrame) -> pd.DataFrame:
     }
     all_items = items["item_id"].astype(str).to_numpy()
     positive_set = set(zip(positives["term_id"], positives["item_id"]))
+    used_negatives: set[tuple[str, str]] = set()
     rng = np.random.default_rng(SEED)
     negative_rows: list[tuple[str, str, str, int, str, float]] = []
 
@@ -179,9 +227,13 @@ def prepare_pairs(items: pd.DataFrame) -> pd.DataFrame:
     for row_number, row in enumerate(positives.itertuples(index=False), start=1):
         term_id = str(row.term_id)
         positive_item = str(row.item_id)
-        random_item = sample_valid(rng, all_items, term_id, positive_set, positive_item)
+        random_item = sample_valid(rng, all_items, term_id, positive_set, positive_item, used_negatives)
+        if random_item is not None:
+            used_negatives.add((term_id, random_item))
         same_root = root_groups.get(item_root.get(positive_item, "unknown"), np.empty(0, dtype=object))
-        root_item = sample_valid(rng, same_root, term_id, positive_set, positive_item)
+        root_item = sample_valid(rng, same_root, term_id, positive_set, positive_item, used_negatives)
+        if root_item is not None:
+            used_negatives.add((term_id, root_item))
         if random_item is not None:
             negative_rows.append((f"V219_R_{row_number}", term_id, random_item, 0, "easy_random", 1.0))
         if root_item is not None:
@@ -232,8 +284,8 @@ def row_cosine(vectorizer: HashingVectorizer, left: pd.Series, right: pd.Series)
 
 
 def digit_features(query: str, item: str) -> tuple[int, int]:
-    query_digits = set(re.findall(r"\d+(?:[.,]\d+)?", query))
-    item_digits = set(re.findall(r"\d+(?:[.,]\d+)?", item))
+    query_digits = set(re.findall(r"\d+(?:p\d+)?", query))
+    item_digits = set(re.findall(r"\d+(?:p\d+)?", item))
     if not query_digits:
         return 0, 0
     return int(query_digits <= item_digits), int(bool(query_digits) and bool(item_digits) and not query_digits <= item_digits)
@@ -276,11 +328,50 @@ def feature_chunk(
         (int(bool(t) and t in q) for q, t in zip(out["query_n"], out["title_n"])), dtype=np.int8, count=len(out)
     )
     out["brand_in_query"] = np.fromiter(
-        (int(bool(b) and b in q) for q, b in zip(out["query_n"], out["brand_n"])), dtype=np.int8, count=len(out)
+        (phrase_in_text(b, q) for q, b in zip(out["query_n"], out["brand_n"])), dtype=np.int8, count=len(out)
     )
     digits = [digit_features(q, t) for q, t in zip(out["query_n"], out["full_n"])]
     out["all_query_digits_in_item"] = np.fromiter((x[0] for x in digits), dtype=np.int8, count=len(out))
     out["digit_conflict"] = np.fromiter((x[1] for x in digits), dtype=np.int8, count=len(out))
+    query_specs = [spec_set(text) for text in out["query_n"]]
+    item_specs = [spec_set(text) for text in out["full_n"]]
+    out["query_has_specs"] = np.fromiter((int(bool(x)) for x in query_specs), dtype=np.int8, count=len(out))
+    out["spec_overlap_ratio"] = np.fromiter(
+        (overlap_ratio(q, i) for q, i in zip(query_specs, item_specs)), dtype=np.float32, count=len(out)
+    )
+    out["spec_conflict"] = np.fromiter(
+        (int(bool(q) and bool(i) and not q <= i) for q, i in zip(query_specs, item_specs)),
+        dtype=np.int8,
+        count=len(out),
+    )
+    query_tokens = [token_set(text) for text in out["query_n"]]
+    item_tokens = [token_set(text) for text in out["full_n"]]
+    query_units = [tokens & UNITS for tokens in query_tokens]
+    item_units = [tokens & UNITS for tokens in item_tokens]
+    out["unit_overlap_ratio"] = np.fromiter(
+        (overlap_ratio(q, i) for q, i in zip(query_units, item_units)), dtype=np.float32, count=len(out)
+    )
+    out["unit_conflict"] = np.fromiter(
+        (int(bool(q) and bool(i) and not q <= i) for q, i in zip(query_units, item_units)),
+        dtype=np.int8,
+        count=len(out),
+    )
+    out["query_main_item_accessory"] = np.fromiter(
+        (
+            int(bool(q & MAIN_DEVICE_TOKENS) and not bool(q & ACCESSORY_TOKENS) and bool(i & ACCESSORY_TOKENS))
+            for q, i in zip(query_tokens, item_tokens)
+        ),
+        dtype=np.int8,
+        count=len(out),
+    )
+    out["query_accessory_item_main"] = np.fromiter(
+        (
+            int(bool(q & ACCESSORY_TOKENS) and bool(i & MAIN_DEVICE_TOKENS) and not bool(i & ACCESSORY_TOKENS))
+            for q, i in zip(query_tokens, item_tokens)
+        ),
+        dtype=np.int8,
+        count=len(out),
+    )
     out["item_seen_positive"] = out["item_id"].isin(seen_items).astype(np.int8)
 
     identity = [column for column in ["id", "term_id", "item_id", "label", "fold", "negative_type", "sample_weight"] if column in out]
