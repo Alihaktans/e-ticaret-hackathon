@@ -537,6 +537,14 @@ def estimate_threshold(oof: pd.DataFrame, test_score: np.ndarray) -> dict:
 
 
 def train_and_submit() -> None:
+    hard_negative_mode = os.environ.get("V219_HARD_NEGATIVE", "0") == "1"
+    run_tag = "v220_crossfit_hard_negative" if hard_negative_mode else "v219"
+    oof_output = PROC / f"{run_tag}_oof_scores.parquet"
+    test_score_output = PROC / f"{run_tag}_test_scores.parquet"
+    model_output = MODELS / f"{run_tag}_raw_pu_lexical.cbm"
+    report_output = REPORTS / f"{run_tag}_raw_pu_lexical.json"
+    submission_dir = ROOT / f"submissions/final_candidates_{'v220' if hard_negative_mode else 'v219'}"
+
     train = pd.read_parquet(TRAIN_FEATURES)
     train[FEATURES] = train[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
     y = train["label"].astype(np.int8).to_numpy(copy=True)
@@ -563,14 +571,54 @@ def train_and_submit() -> None:
     # partially relevant class, which is positive in the current binary stage.
     y[partial_positive] = np.int8(1)
     weights[partial_positive] = np.float32(0.35)
+    hard_negative_report = None
+    if hard_negative_mode:
+        if not OOF_SCORES.exists():
+            raise FileNotFoundError(
+                f"Hard-negative mode needs the baseline cross-fit scores: {OOF_SCORES}"
+            )
+        previous_oof = pd.read_parquet(OOF_SCORES, columns=["id", "score"])
+        if len(previous_oof) != len(train) or not previous_oof["id"].astype(str).reset_index(drop=True).equals(
+            train["id"].astype(str).reset_index(drop=True)
+        ):
+            raise ValueError("V219 OOF/train row alignment mismatch; refusing hard-negative mining")
+        previous_score = previous_oof["score"].astype(np.float32).to_numpy()
+        easy_mask = train["negative_type"].eq("easy_random").to_numpy()
+        easy_cutoff = float(np.quantile(previous_score[easy_mask], 0.90))
+        weak_cutoff = float(np.quantile(previous_score[weak_same_root], 0.90))
+        hard_easy = easy_mask & (previous_score >= easy_cutoff)
+        hard_weak_same_root = weak_same_root & (previous_score >= weak_cutoff)
+        # Easy-random labels are the safest negatives. The weak same-root subset is
+        # already the bottom lexical tail, so boosting only its OOF false positives
+        # is conservative with respect to partially relevant products.
+        weights[hard_easy] = np.float32(2.0)
+        weights[hard_weak_same_root] = np.float32(0.75)
+        hard_negative_report = {
+            "source": str(OOF_SCORES),
+            "selection": "previous term-grouped OOF false positives",
+            "easy_random_quantile": 0.90,
+            "easy_random_score_cutoff": easy_cutoff,
+            "easy_random_rows": int(hard_easy.sum()),
+            "easy_random_weight": 2.0,
+            "weak_same_root_quantile": 0.90,
+            "weak_same_root_score_cutoff": weak_cutoff,
+            "weak_same_root_rows": int(hard_weak_same_root.sum()),
+            "weak_same_root_weight": 0.75,
+            "protected_partial_positive_rows": int(partial_positive.sum()),
+            "protected_unlabeled_rows": int((same_root_mask & ~weak_same_root & ~partial_positive).sum()),
+        }
     print(
         {
             "binary_target": "relevant_or_partially_relevant_vs_irrelevant",
-            "same_root_unlabeled_zero_weight": int((same_root_mask & ~weak_same_root).sum()),
+            "same_root_unlabeled_zero_weight": int(
+                (same_root_mask & ~weak_same_root & ~partial_positive).sum()
+            ),
             "same_root_weak_negative": int(weak_same_root.sum()),
             "same_root_partial_positive": int(partial_positive.sum()),
             "same_root_proxy_cutoff": same_root_cutoff,
             "same_root_partial_positive_cutoff": same_root_positive_cutoff,
+            "hard_negative_mode": hard_negative_mode,
+            "hard_negative_report": hard_negative_report,
         },
         flush=True,
     )
@@ -607,13 +655,13 @@ def train_and_submit() -> None:
     oof["training_weight"] = weights
     oof["partial_positive"] = partial_positive.astype(np.int8)
     oof["score"] = oof_score
-    OOF_SCORES.parent.mkdir(parents=True, exist_ok=True)
-    oof.to_parquet(OOF_SCORES, index=False, compression="zstd")
+    oof_output.parent.mkdir(parents=True, exist_ok=True)
+    oof.to_parquet(oof_output, index=False, compression="zstd")
 
     final_iterations = max(300, int(np.median(best_iterations)))
     final_model = fit_model(train[FEATURES], y, weights, final_iterations)
     MODELS.mkdir(parents=True, exist_ok=True)
-    final_model.save_model(MODEL_PATH)
+    final_model.save_model(model_output)
     del train
     gc.collect()
 
@@ -628,13 +676,13 @@ def train_and_submit() -> None:
     prediction = (test_score >= threshold).astype(np.int8)
     test_out = test[["id", "term_id", "item_id"]].copy()
     test_out["v219_score"] = test_score
-    test_out.to_parquet(TEST_SCORES, index=False, compression="zstd")
+    test_out.to_parquet(test_score_output, index=False, compression="zstd")
 
     sample = pd.read_csv(RAW / "sample_submission.csv", usecols=["id"])
     if not sample["id"].astype(str).reset_index(drop=True).equals(test["id"].astype(str).reset_index(drop=True)):
         raise ValueError("sample/test ID alignment mismatch")
-    SUBMISSIONS.mkdir(parents=True, exist_ok=True)
-    output = SUBMISSIONS / "FINAL_CANDIDATE_v219_pu_mixture.csv"
+    submission_dir.mkdir(parents=True, exist_ok=True)
+    output = submission_dir / f"FINAL_CANDIDATE_{run_tag}_pu_mixture.csv"
     pd.DataFrame({"id": sample["id"], "prediction": prediction}).to_csv(output, index=False)
 
     prior_outputs = {}
@@ -644,7 +692,7 @@ def train_and_submit() -> None:
         prior_threshold = float(np.quantile(test_score, 1.0 - target_prior))
         prior_prediction = (test_score >= prior_threshold).astype(np.int8)
         tag = str(round(target_prior, 3)).replace(".", "p")
-        prior_path = SUBMISSIONS / f"CANDIDATE_v219_prior_{tag}.csv"
+        prior_path = submission_dir / f"CANDIDATE_{run_tag}_prior_{tag}.csv"
         pd.DataFrame({"id": sample["id"], "prediction": prior_prediction}).to_csv(prior_path, index=False)
         prior_outputs[tag] = {
             "path": str(prior_path),
@@ -655,6 +703,7 @@ def train_and_submit() -> None:
 
     report = {
         "hardware_profile": "RTX 4060 Laptop / 16 GB RAM / 13th gen i7",
+        "run_tag": run_tag,
         "features": FEATURES,
         "folds": N_FOLDS,
         "iterations": final_iterations,
@@ -664,6 +713,7 @@ def train_and_submit() -> None:
         "submission": str(output),
         "prior_candidates": prior_outputs,
         "test_prediction_source": "mean probability from term-grouped fold models",
+        "hard_negative_mining": hard_negative_report,
         "binary_target": "relevant_or_partially_relevant_vs_irrelevant",
         "same_root_policy": {
             "interpretation": "unlabeled because partially relevant is positive in this stage",
@@ -683,7 +733,7 @@ def train_and_submit() -> None:
         ),
     }
     REPORTS.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf8")
+    report_output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf8")
     print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
 
 
