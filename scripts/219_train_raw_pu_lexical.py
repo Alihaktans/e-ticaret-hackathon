@@ -538,7 +538,9 @@ def train_and_submit() -> None:
     train = pd.read_parquet(TRAIN_FEATURES)
     train[FEATURES] = train[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
     y = train["label"].astype(np.int8).to_numpy()
-    weights = train["sample_weight"].astype(np.float32).to_numpy()
+    # Arrow-backed parquet columns may expose a read-only NumPy view. We mutate
+    # weights for the binary partial-relevance policy, so require an owned array.
+    weights = train["sample_weight"].astype(np.float32).to_numpy(copy=True)
     # The raw labels only identify positives. Same-root samples are unlabeled and
     # can be partially relevant, which is positive in the current binary stage.
     # Keep only the lexically weakest tail as low-confidence irrelevant examples.
