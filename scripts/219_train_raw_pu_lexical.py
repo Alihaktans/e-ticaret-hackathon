@@ -357,19 +357,41 @@ def catboost_params(iterations: int) -> dict:
     }
 
 
-def fit_model(x: pd.DataFrame, y: np.ndarray, weights: np.ndarray, iterations: int) -> CatBoostClassifier:
+def fit_model(
+    x: pd.DataFrame,
+    y: np.ndarray,
+    weights: np.ndarray,
+    iterations: int,
+    valid_x: pd.DataFrame | None = None,
+    valid_y: np.ndarray | None = None,
+) -> CatBoostClassifier:
     params = catboost_params(iterations)
     model = CatBoostClassifier(**params)
+    fit_kwargs = {}
+    if valid_x is not None and valid_y is not None:
+        fit_kwargs = {
+            "eval_set": (valid_x, valid_y),
+            "use_best_model": True,
+            "early_stopping_rounds": 100,
+        }
     try:
-        model.fit(x, y, sample_weight=weights)
+        model.fit(x, y, sample_weight=weights, **fit_kwargs)
     except Exception as exc:
         print("GPU fallback:", repr(exc), flush=True)
         params["task_type"] = "CPU"
         params.pop("devices", None)
         params["thread_count"] = max(1, (os.cpu_count() or 4) - 2)
         model = CatBoostClassifier(**params)
-        model.fit(x, y, sample_weight=weights)
+        model.fit(x, y, sample_weight=weights, **fit_kwargs)
     return model
+
+
+def predict_chunks(model: CatBoostClassifier, frame: pd.DataFrame, chunk_size: int = 250000) -> np.ndarray:
+    output = np.empty(len(frame), dtype=np.float32)
+    for start in range(0, len(frame), chunk_size):
+        end = min(start + chunk_size, len(frame))
+        output[start:end] = model.predict_proba(frame.iloc[start:end][FEATURES])[:, 1].astype(np.float32)
+    return output
 
 
 def histogram(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
@@ -388,18 +410,24 @@ def macro_from_rates(prior: float, tpr: float, fpr: float) -> float:
 def estimate_threshold(oof: pd.DataFrame, test_score: np.ndarray) -> dict:
     bins = np.linspace(0.0, 1.0, 501)
     positive_hist = histogram(oof.loc[oof["label"].eq(1), "score"].to_numpy(), bins)
-    # Easy random negatives better approximate the dominant irrelevant test component.
     random_hist = histogram(oof.loc[oof["negative_type"].eq("easy_random"), "score"].to_numpy(), bins)
+    hard_hist = histogram(oof.loc[oof["negative_type"].eq("same_root"), "score"].to_numpy(), bins)
     test_hist = histogram(test_score, bins)
-    matrix = np.stack([random_hist, positive_hist], axis=1)
+    # Test candidates contain both obvious and confusing negatives. Fitting both
+    # components avoids the severe FPR optimism of an easy-random-only calibration.
+    matrix = np.stack([random_hist, hard_hist, positive_hist], axis=1)
     weights, _ = nnls(
-        np.vstack([matrix, np.ones((1, 2)) * 10.0]),
+        np.vstack([matrix, np.ones((1, 3)) * 10.0]),
         np.concatenate([test_hist, [10.0]]),
     )
     weights /= max(weights.sum(), 1e-12)
-    prior = float(np.clip(weights[1], 0.03, 0.60))
+    prior = float(np.clip(weights[2], 0.03, 0.60))
+    negative_weight_sum = max(float(weights[0] + weights[1]), 1e-12)
+    fitted_negative_hist = (
+        float(weights[0]) * random_hist + float(weights[1]) * hard_hist
+    ) / negative_weight_sum
     positive_tail = np.cumsum(positive_hist[::-1])[::-1]
-    negative_tail = np.cumsum(random_hist[::-1])[::-1]
+    negative_tail = np.cumsum(fitted_negative_hist[::-1])[::-1]
     candidates = []
     for index in range(len(positive_tail)):
         threshold = float(bins[index])
@@ -409,6 +437,9 @@ def estimate_threshold(oof: pd.DataFrame, test_score: np.ndarray) -> dict:
     score, threshold, tpr, fpr = max(candidates)
     return {
         "estimated_positive_prior": prior,
+        "mixture_easy_negative_weight": float(weights[0]),
+        "mixture_hard_negative_weight": float(weights[1]),
+        "mixture_positive_weight_raw": float(weights[2]),
         "threshold": threshold,
         "estimated_macro_f1": score,
         "estimated_tpr": tpr,
@@ -425,12 +456,23 @@ def train_and_submit() -> None:
     folds = train["fold"].astype(np.int8).to_numpy()
     oof_score = np.empty(len(train), dtype=np.float32)
     best_iterations = []
+    test = pd.read_parquet(TEST_FEATURES)
+    test[FEATURES] = test[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
+    fold_test_scores = []
 
     for fold in range(N_FOLDS):
         tr = folds != fold
         va = folds == fold
-        model = fit_model(train.loc[tr, FEATURES], y[tr], weights[tr], ITERATIONS)
+        model = fit_model(
+            train.loc[tr, FEATURES],
+            y[tr],
+            weights[tr],
+            ITERATIONS,
+            valid_x=train.loc[va, FEATURES],
+            valid_y=y[va],
+        )
         oof_score[va] = model.predict_proba(train.loc[va, FEATURES])[:, 1].astype(np.float32)
+        fold_test_scores.append(predict_chunks(model, test))
         best_iteration = model.get_best_iteration()
         best_iterations.append(ITERATIONS if best_iteration is None or best_iteration <= 0 else best_iteration)
         print({"fold": fold, "train": int(tr.sum()), "valid": int(va.sum())}, flush=True)
@@ -449,13 +491,11 @@ def train_and_submit() -> None:
     del train
     gc.collect()
 
-    test = pd.read_parquet(TEST_FEATURES)
-    test[FEATURES] = test[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
-    test_score = np.empty(len(test), dtype=np.float32)
-    for start in range(0, len(test), 250000):
-        end = min(start + 250000, len(test))
-        test_score[start:end] = final_model.predict_proba(test.iloc[start:end][FEATURES])[:, 1].astype(np.float32)
-        print("predict", end, "/", len(test), flush=True)
+    # OOF and test probabilities now come from models trained on the same fold
+    # proportions, so the selected threshold is applied on a compatible scale.
+    test_score = np.mean(np.stack(fold_test_scores), axis=0).astype(np.float32)
+    del fold_test_scores
+    gc.collect()
 
     calibration = estimate_threshold(oof, test_score)
     threshold = calibration["threshold"]
@@ -471,6 +511,22 @@ def train_and_submit() -> None:
     output = SUBMISSIONS / "FINAL_CANDIDATE_v219_pu_mixture.csv"
     pd.DataFrame({"id": sample["id"], "prediction": prediction}).to_csv(output, index=False)
 
+    prior_outputs = {}
+    estimated_prior = float(calibration["estimated_positive_prior"])
+    for offset in (-0.03, 0.0, 0.03):
+        target_prior = float(np.clip(estimated_prior + offset, 0.01, 0.80))
+        prior_threshold = float(np.quantile(test_score, 1.0 - target_prior))
+        prior_prediction = (test_score >= prior_threshold).astype(np.int8)
+        tag = str(round(target_prior, 3)).replace(".", "p")
+        prior_path = SUBMISSIONS / f"CANDIDATE_v219_prior_{tag}.csv"
+        pd.DataFrame({"id": sample["id"], "prediction": prior_prediction}).to_csv(prior_path, index=False)
+        prior_outputs[tag] = {
+            "path": str(prior_path),
+            "target_prior": target_prior,
+            "threshold": prior_threshold,
+            "positive_ratio": float(prior_prediction.mean()),
+        }
+
     report = {
         "hardware_profile": "RTX 4060 Laptop / 16 GB RAM / 13th gen i7",
         "features": FEATURES,
@@ -480,6 +536,8 @@ def train_and_submit() -> None:
         "calibration": calibration,
         "submission_positive_ratio": float(prediction.mean()),
         "submission": str(output),
+        "prior_candidates": prior_outputs,
+        "test_prediction_source": "mean probability from term-grouped fold models",
         "warning": (
             "Raw labels are positive-only. Negative labels are synthetic; estimated Macro-F1 and prior "
             "depend on the random-negative mixture assumption and are not ground-truth leaderboard metrics."
