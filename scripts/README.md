@@ -16,6 +16,7 @@ gelmez. Dosyalar geriye dönük karşılaştırmalar için korunur.
 | `122–164` | gelişmiş lexical/semantic guard ve pairwise modeller |
 | `165–193` | Qwen denetimleri, Trendyol embedding ve contrastive eğitim |
 | `194–217` | bağımsız sınıflandırıcılar, rulepack ve final audit çalışmaları |
+| `218+` | OOF tabanlı meta-ensemble ve kalibrasyon deneyleri |
 
 ## Çalıştırma kuralları
 
@@ -40,4 +41,3 @@ açıklayıcı bir isim yapın:
 
 Birbirinin küçük varyasyonu olan çok sayıda script yerine parametreli tek script ve
 CSV/JSON deney özeti tercih edin.
-
