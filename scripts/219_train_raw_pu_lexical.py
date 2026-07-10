@@ -502,23 +502,19 @@ def estimate_threshold(oof: pd.DataFrame, test_score: np.ndarray) -> dict:
     bins = np.linspace(0.0, 1.0, 501)
     positive_hist = histogram(oof.loc[oof["label"].eq(1), "score"].to_numpy(), bins)
     random_hist = histogram(oof.loc[oof["negative_type"].eq("easy_random"), "score"].to_numpy(), bins)
-    hard_hist = histogram(oof.loc[oof["negative_type"].eq("same_root"), "score"].to_numpy(), bins)
     test_hist = histogram(test_score, bins)
-    # Test candidates contain both obvious and confusing negatives. Fitting both
-    # components avoids the severe FPR optimism of an easy-random-only calibration.
-    matrix = np.stack([random_hist, hard_hist, positive_hist], axis=1)
+    # Current binary target accepts both fully and partially relevant products.
+    # Same-root unlabeled rows may contain that partially relevant class, therefore
+    # they must not define the negative component of the binary calibration.
+    matrix = np.stack([random_hist, positive_hist], axis=1)
     weights, _ = nnls(
-        np.vstack([matrix, np.ones((1, 3)) * 10.0]),
+        np.vstack([matrix, np.ones((1, 2)) * 10.0]),
         np.concatenate([test_hist, [10.0]]),
     )
     weights /= max(weights.sum(), 1e-12)
-    prior = float(np.clip(weights[2], 0.03, 0.60))
-    negative_weight_sum = max(float(weights[0] + weights[1]), 1e-12)
-    fitted_negative_hist = (
-        float(weights[0]) * random_hist + float(weights[1]) * hard_hist
-    ) / negative_weight_sum
+    prior = float(np.clip(weights[1], 0.03, 0.80))
     positive_tail = np.cumsum(positive_hist[::-1])[::-1]
-    negative_tail = np.cumsum(fitted_negative_hist[::-1])[::-1]
+    negative_tail = np.cumsum(random_hist[::-1])[::-1]
     candidates = []
     for index in range(len(positive_tail)):
         threshold = float(bins[index])
@@ -528,9 +524,8 @@ def estimate_threshold(oof: pd.DataFrame, test_score: np.ndarray) -> dict:
     score, threshold, tpr, fpr = max(candidates)
     return {
         "estimated_positive_prior": prior,
-        "mixture_easy_negative_weight": float(weights[0]),
-        "mixture_hard_negative_weight": float(weights[1]),
-        "mixture_positive_weight_raw": float(weights[2]),
+        "mixture_irrelevant_weight": float(weights[0]),
+        "mixture_relevant_or_partial_weight_raw": float(weights[1]),
         "threshold": threshold,
         "estimated_macro_f1": score,
         "estimated_tpr": tpr,
@@ -544,6 +539,29 @@ def train_and_submit() -> None:
     train[FEATURES] = train[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
     y = train["label"].astype(np.int8).to_numpy()
     weights = train["sample_weight"].astype(np.float32).to_numpy()
+    # The raw labels only identify positives. Same-root samples are unlabeled and
+    # can be partially relevant, which is positive in the current binary stage.
+    # Keep only the lexically weakest tail as low-confidence irrelevant examples.
+    same_root_mask = train["negative_type"].eq("same_root").to_numpy()
+    lexical_proxy = (
+        0.35 * train["char_full"].to_numpy(dtype=np.float32)
+        + 0.30 * train["word_full"].to_numpy(dtype=np.float32)
+        + 0.20 * train["char_title"].to_numpy(dtype=np.float32)
+        + 0.15 * train["word_title"].to_numpy(dtype=np.float32)
+    )
+    same_root_cutoff = float(np.quantile(lexical_proxy[same_root_mask], 0.35))
+    weak_same_root = same_root_mask & (lexical_proxy <= same_root_cutoff)
+    weights[same_root_mask] = np.float32(0.0)
+    weights[weak_same_root] = np.float32(0.25)
+    print(
+        {
+            "binary_target": "relevant_or_partially_relevant_vs_irrelevant",
+            "same_root_unlabeled_zero_weight": int((same_root_mask & ~weak_same_root).sum()),
+            "same_root_weak_negative": int(weak_same_root.sum()),
+            "same_root_proxy_cutoff": same_root_cutoff,
+        },
+        flush=True,
+    )
     folds = train["fold"].astype(np.int8).to_numpy()
     oof_score = np.empty(len(train), dtype=np.float32)
     best_iterations = []
@@ -629,6 +647,15 @@ def train_and_submit() -> None:
         "submission": str(output),
         "prior_candidates": prior_outputs,
         "test_prediction_source": "mean probability from term-grouped fold models",
+        "binary_target": "relevant_or_partially_relevant_vs_irrelevant",
+        "same_root_policy": {
+            "interpretation": "unlabeled because partially relevant is positive in this stage",
+            "weak_negative_quantile": 0.35,
+            "weak_negative_weight": 0.25,
+            "lexical_proxy_cutoff": same_root_cutoff,
+            "zero_weight_rows": int((same_root_mask & ~weak_same_root).sum()),
+            "weak_negative_rows": int(weak_same_root.sum()),
+        },
         "warning": (
             "Raw labels are positive-only. Negative labels are synthetic; estimated Macro-F1 and prior "
             "depend on the random-negative mixture assumption and are not ground-truth leaderboard metrics."
